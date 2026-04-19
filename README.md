@@ -69,6 +69,8 @@ I²C SDA/SCL  ──►  BME680, HM3301, TSL2561
 
 ![Hardware photo](images/hardware.jpg)
 
+> **Screenshot previews** — Open [`images/dashboard.html`](images/dashboard.html), [`images/graphs.html`](images/graphs.html) and [`images/config.html`](images/config.html) in any browser to see pixel-perfect UI mockups with dummy data. Screenshot them and save as `images/dashboard.png`, `images/graphs.png` and `images/config.png` to populate the images below.
+
 ---
 
 ## Web Interface
@@ -327,9 +329,17 @@ Nine read-only presets are compiled in.  All values can be overridden with a **C
 | ArduinoHttpClient | latest |
 | Tomoto_HM330X | latest |
 
+> **Note:** `Wire`, `WiFi`, `WiFiUdp`, `WebServer`, `Preferences`, `SPIFFS`, `EEPROM` and the FreeRTOS / ESP-IDF headers (`esp_heap_caps.h`, `driver/pulse_cnt.h`, etc.) are all bundled with the **Espressif ESP32 board package** — no separate install needed.
+
 ### Credentials file
 
-Create `arduino_secrets.h` in the sketch folder (this file is git-ignored):
+Copy the included template and fill in your values:
+
+```bash
+cp arduino_secrets.h.example arduino_secrets.h
+```
+
+Then edit `arduino_secrets.h`:
 
 ```cpp
 #define SECRET_SSID    "YourWiFiSSID"
@@ -373,8 +383,17 @@ The `partitions.csv` in the `build/` folder reflects this layout.
 Environmental_Stationary_Logger_V1.4/
 ├── Environmental_Stationary_Logger_V1.4.ino   Main sketch
 ├── arduino_secrets.h                           WiFi + API credentials (git-ignored)
+├── arduino_secrets.h.example                  Credentials template — copy and fill in
 ├── logger_user_config.h                        Tube preset definitions + compile-time defaults
 ├── bsec_iaq.h                                  BSEC binary config (3.3 V, 3s LP, 4d age)
+├── README.md
+├── images/
+│   ├── dashboard.html                          Browser-renderable dashboard preview (dummy data)
+│   ├── graphs.html                             Browser-renderable graphs preview (dummy data)
+│   ├── config.html                             Browser-renderable config page preview
+│   ├── dashboard.png                           Screenshot → save from dashboard.html
+│   ├── graphs.png                              Screenshot → save from graphs.html
+│   └── config.png                              Screenshot → save from config.html
 ├── src/
 │   ├── Digital_Light_TSL2561.h / .cpp          Local TSL2561 luminosity driver
 │   ├── Seeed_HM330X.h / .cpp                  Local HM3301 PM sensor driver
