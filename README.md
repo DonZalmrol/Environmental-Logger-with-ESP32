@@ -69,8 +69,6 @@ I²C SDA/SCL  ──►  BME680, HM3301, TSL2561
 
 ![Hardware photo](images/hardware.jpg)
 
-> **Screenshot previews** — Open [`images/dashboard.html`](images/dashboard.html), [`images/graphs.html`](images/graphs.html) and [`images/config.html`](images/config.html) in any browser to see pixel-perfect UI mockups with dummy data. Screenshot them and save as `images/dashboard.png`, `images/graphs.png` and `images/config.png` to populate the images below.
-
 ---
 
 ## Web Interface
@@ -114,8 +112,6 @@ The main page polls `/json` every second and updates all values live.
 | IAQ | IAQ score |
 | CO₂ | ppm |
 | Particulates | PM 1.0, PM 2.5, PM 10 |
-
-![Dashboard charts screenshot](images/dashboard_charts.png)
 
 ---
 
