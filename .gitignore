@@ -1,0 +1,43 @@
+# ============================================================
+#  .gitignore — Environmental Stationary Logger
+# ============================================================
+
+# ----- CREDENTIALS (must never be committed) ----------------
+arduino_secrets.h
+
+# ----- ARDUINO IDE BUILD OUTPUT -----------------------------
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# ----- EDITOR / BACKUP FILES --------------------------------
+*.bak
+*.orig
+*.swp
+*~
+
+# ----- OPERATING SYSTEM NOISE ------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+
+# ----- IDE / TOOL STATE -------------------------------------
+.vscode/
+.theia/
+.idea/
+*.code-workspace
+
+# ----- BUILD OUTPUT -----------------------------------------
+build/
