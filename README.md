@@ -67,7 +67,7 @@ I²C SDA/SCL  ──►  BME680, HM3301, TSL2561
 > The PCNT filter is set to 100 clock cycles to debounce tube pulses.  
 > Both counters are paused, read and cleared every second per ESP-IDF requirements.
 
-![Hardware photo](images/hardware.jpg)
+![Hardware photo](images/Hardware%20V1.jpeg)
 
 ---
 
@@ -384,12 +384,13 @@ Environmental_Stationary_Logger_V1.4/
 ├── bsec_iaq.h                                  BSEC binary config (3.3 V, 3s LP, 4d age)
 ├── README.md
 ├── images/
+│   ├── Hardware V1.jpeg                        Hardware photo
 │   ├── dashboard.html                          Browser-renderable dashboard preview (dummy data)
 │   ├── graphs.html                             Browser-renderable graphs preview (dummy data)
 │   ├── config.html                             Browser-renderable config page preview
-│   ├── dashboard.png                           Screenshot → save from dashboard.html
-│   ├── graphs.png                              Screenshot → save from graphs.html
-│   └── config.png                              Screenshot → save from config.html
+│   ├── dashboard.png                           Dashboard screenshot
+│   ├── graphs.png                              Graphs screenshot
+│   └── config.png                              Config page screenshot
 ├── src/
 │   ├── Digital_Light_TSL2561.h / .cpp          Local TSL2561 luminosity driver
 │   ├── Seeed_HM330X.h / .cpp                  Local HM3301 PM sensor driver
