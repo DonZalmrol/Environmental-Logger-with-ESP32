@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>envlogger : Environmental Logger — Config Preview</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+:root{--bg:#10161d;--bg-soft:#17212b;--card:#1c2733;--border:#334456;--text:#f3f7fb;--muted:#c5d1dd;--accent:#58a6ff;--accent-strong:#3d8bfd;--chip:#1a2834;--shadow:rgba(0,0,0,.28);--heroA:#17324a;--heroB:#245e86;--surface:rgba(255,255,255,.08);color-scheme:dark;}
+body[data-theme="light"]{--bg:#eff4f8;--bg-soft:#f7fafc;--card:#ffffff;--border:#d4dee8;--text:#17212b;--muted:#5d6d7d;--accent:#1e6bd6;--accent-strong:#1451a8;--chip:#eef3f7;--shadow:rgba(22,41,66,.12);--heroA:#ddebf7;--heroB:#f7fbff;--surface:rgba(255,255,255,.72);color-scheme:light;}
+*{box-sizing:border-box;}
+body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:radial-gradient(circle at top,var(--heroA),var(--bg) 38%);color:var(--text);transition:background-color .25s,color .25s;}
+.page-shell{max-width:1240px;margin:0 auto;padding:20px 16px 28px;}
+.topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:12px 14px;border:1px solid var(--border);border-radius:18px;background:var(--surface);backdrop-filter:blur(12px);box-shadow:0 12px 28px var(--shadow);}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.02em;color:var(--text);}
+.brand-mark{width:34px;height:34px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;font-size:1rem;}
+.menu{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
+.menu-link{border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;padding:8px 12px;font-size:.84rem;font-weight:600;}
+.menu-link.active{background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;border-color:transparent;}
+.theme-picker{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:8px 12px;}
+.theme-picker label{font-size:.8rem;color:var(--muted);font-weight:700;letter-spacing:.04em;text-transform:uppercase;}
+.theme-picker select{background:var(--bg-soft);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:6px 10px;font:inherit;outline:none;}
+.hero{padding:24px;border:1px solid var(--border);border-radius:24px;background:linear-gradient(135deg,var(--surface),rgba(255,255,255,.02)),linear-gradient(135deg,var(--heroA),var(--heroB));box-shadow:0 20px 40px var(--shadow);margin-bottom:22px;}
+.hero-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:end;}
+.hero h1{margin:0 0 6px;font-size:clamp(1.6rem,3vw,2.4rem);line-height:1.05;color:var(--text);}
+.hero p{margin:0;color:var(--muted);max-width:780px;}
+.hero-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
+.hero-chip{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:var(--chip);font-size:.82rem;color:var(--text);}
+.card{background:var(--card)!important;border:1px solid var(--border)!important;border-radius:20px!important;box-shadow:0 18px 36px var(--shadow)!important;color:var(--text);}
+.card h2,.card h3,.card h4,.card h5,.card h6,.card .fw-semibold,.text-body-secondary,.form-label,.form-check-label{color:var(--text)!important;}
+.hint,.form-text,.small{color:var(--muted)!important;}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}
+.form-control,.form-select{background:var(--bg-soft)!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:14px!important;}
+.form-control::placeholder{color:var(--muted)!important;}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent-strong))!important;border:none!important;}
+.btn-warning{color:#17212b!important;}
+.btn-outline-primary{border-color:var(--accent)!important;color:var(--text)!important;background:transparent!important;}
+.btn-outline-secondary{border-color:var(--border)!important;color:var(--text)!important;background:transparent!important;}
+.alert{border-radius:16px!important;border:1px solid var(--border)!important;color:var(--text)!important;background:var(--bg-soft)!important;}
+.alert-warning{background:rgba(255,193,7,.14)!important;color:var(--text)!important;border-color:rgba(255,193,7,.38)!important;}
+.alert-success{background:rgba(25,135,84,.14)!important;color:var(--text)!important;border-color:rgba(25,135,84,.36)!important;}
+.border.rounded-3,.bg-body-tertiary{border-color:var(--border)!important;background:var(--bg-soft)!important;border-radius:18px!important;color:var(--text)!important;}
+a{color:var(--accent);}
+footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted);border-top:1px solid var(--border);margin-top:28px;}
+</style>
+</head>
+<body>
+<main class="page-shell">
+
+<!-- TOPBAR -->
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">&#9762;</span><span>Environmental Logger</span></div>
+  <nav class="menu">
+    <a class="menu-link" href="dashboard.html">Dashboard</a>
+    <a class="menu-link" href="graphs.html">Graphs</a>
+    <a class="menu-link active" href="#">Config</a>
+    <a class="menu-link" href="#">OTA Check</a>
+    <a class="menu-link" href="#">OTA Update</a>
+    <a class="menu-link" href="#">JSON</a>
+    <div class="theme-picker">
+      <label for="themeSelect">Theme</label>
+      <select id="themeSelect"><option value="dark">Dark</option><option value="light">Light</option></select>
+    </div>
+  </nav>
+</header>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-grid">
+    <div>
+      <h1>Device Configuration</h1>
+      <p>Edit runtime WiFi and upload credentials stored on the ESP32.</p>
+      <div class="hero-meta">
+        <span class="hero-chip">Device IP <span class="mono">192.168.1.42</span></span>
+        <span class="hero-chip">Hostname <span class="mono">envlogger</span></span>
+        <span class="hero-chip"><span class="mono">uptime 3 days, 07:14</span></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CONTENT -->
+<div class="row g-4">
+
+  <!-- FORM COLUMN -->
+  <div class="col-12 col-xl-8">
+    <div class="card">
+      <div class="card-body">
+        <h2 class="h5 mb-3">Runtime Configuration</h2>
+        <p class="hint mb-4">Values saved here override the compiled defaults. Text fields fall back to <span class="mono">arduino_secrets.h</span> when left blank, numeric fields fall back to their compiled firmware defaults when cleared, and secret fields stay unchanged unless you enter a replacement or tick their reset box.</p>
+        <form class="row g-3">
+
+          <!-- General -->
+          <div class="col-12"><h3 class="h6 text-uppercase text-body-secondary mb-1">General</h3></div>
+          <div class="col-md-6">
+            <label class="form-label" for="station_name">Station Name</label>
+            <input class="form-control" id="station_name" value="Station Dashboard">
+            <div class="form-text">Label shown in the dashboard title.</div>
+          </div>
+
+          <!-- WiFi -->
+          <div class="col-12"><h3 class="h6 text-uppercase text-body-secondary mb-1">WiFi</h3></div>
+          <div class="col-md-6">
+            <label class="form-label">SSID</label>
+            <input class="form-control" value="MyHomeNetwork">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Password</label>
+            <input class="form-control" type="password" placeholder="Stored value masked">
+            <div class="form-text">Leave blank to keep the current password.</div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Hostname</label>
+            <input class="form-control" value="envlogger">
+          </div>
+          <div class="col-12">
+            <div class="border rounded-3 p-3 bg-body-tertiary">
+              <div class="d-flex flex-column flex-lg-row justify-content-between gap-3 align-items-lg-center">
+                <div>
+                  <div class="fw-semibold">Nearby WiFi Networks</div>
+                  <div class="hint">Open the scanner page, pick an SSID there, and it will return here with the WiFi field prefilled.</div>
+                </div>
+                <a class="btn btn-outline-primary" href="#">Open WiFi Scanner</a>
+              </div>
+            </div>
+          </div>
+
+          <!-- radmon.org -->
+          <div class="col-12 pt-2"><h3 class="h6 text-uppercase text-body-secondary mb-1">radmon.org</h3></div>
+          <div class="col-12">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="radmon_en" checked>
+              <label class="form-check-label" for="radmon_en">Enable Radmon uploads</label>
+              <div class="form-text">When disabled, the device keeps sampling normally but skips Radmon submissions.</div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">User Name</label>
+            <input class="form-control" value="my_radmon_user">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Password</label>
+            <input class="form-control" type="password" placeholder="Stored value masked">
+            <div class="form-text">Leave blank to keep the current password.</div>
+          </div>
+
+          <!-- uRADMonitor -->
+          <div class="col-12 pt-2"><h3 class="h6 text-uppercase text-body-secondary mb-1">uRADMonitor</h3></div>
+          <div class="col-12">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="urad_en" checked>
+              <label class="form-check-label" for="urad_en">Enable uRADMonitor uploads</label>
+              <div class="form-text">When disabled, the device keeps local logging and web features active but skips uRADMonitor submissions.</div>
+            </div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">User ID</label>
+            <input class="form-control" value="123456">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">User Key</label>
+            <input class="form-control" type="password" placeholder="Stored value masked">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Device ID</label>
+            <input class="form-control" value="654321">
+          </div>
+
+          <!-- Time -->
+          <div class="col-12 pt-2"><h3 class="h6 text-uppercase text-body-secondary mb-1">Time and Region</h3></div>
+          <div class="col-md-4">
+            <label class="form-label">UTC Offset (minutes)</label>
+            <input class="form-control mono" value="60">
+            <div class="form-text">Examples: 60 for CET, 0 for UTC, -300 for EST.</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">DST Profile</label>
+            <select class="form-select">
+              <option selected>EU (last Sunday March / October)</option>
+              <option>US (second Sunday March / first Sunday November)</option>
+              <option>AU (first Sunday October / first Sunday April)</option>
+              <option>None (no automatic DST)</option>
+            </select>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">DST Shift (minutes)</label>
+            <input class="form-control mono" value="60">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">NTP Server</label>
+            <input class="form-control mono" value="pool.ntp.org">
+          </div>
+          <div class="col-12">
+            <div class="border rounded-3 p-3 bg-body-tertiary">
+              <div class="fw-semibold mb-1">Current time policy</div>
+              <div class="hint">Local clock uses <span class="mono">UTC+01:00</span> with <span class="mono">EU Summer Time</span> and a <span class="mono">60 min</span> DST shift.</div>
+            </div>
+          </div>
+
+          <!-- Diagnostics -->
+          <div class="col-12 pt-2"><h3 class="h6 text-uppercase text-body-secondary mb-1">Diagnostics</h3></div>
+          <div class="col-12">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="serial_v" checked>
+              <label class="form-check-label" for="serial_v">Verbose serial logging</label>
+              <div class="form-text">When ON: per-second CPS readings, 61-second sensor dumps, and upload traces are printed to the serial port.</div>
+            </div>
+          </div>
+
+          <!-- Calibration -->
+          <div class="col-12 pt-2"><h3 class="h6 text-uppercase text-body-secondary mb-1">Calibration and Logging</h3></div>
+          <div class="col-md-4">
+            <label class="form-label">Tube HV Calibration</label>
+            <input class="form-control mono" value="184.097">
+            <div class="form-text">ADC-to-HV multiplier used by the tube voltage display.</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">HCHO R0</label>
+            <input class="form-control mono" value="10.370">
+            <div class="form-text">Sensor calibration value used by the Grove HCHO conversion formula.</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Historic Storage (hours)</label>
+            <input class="form-control mono" value="6">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">CPM Gauge Full-Scale</label>
+            <input class="form-control mono" value="600">
+            <div class="form-text">CPM at which the radiation gauge reads 100%.</div>
+          </div>
+          <div class="col-12">
+            <div class="alert alert-warning mb-0">Warning: increasing historic storage beyond 24 hours can fill the entire SPIFFS partition on this build.</div>
+          </div>
+
+          <!-- Tube Setup -->
+          <div class="col-12 pt-2"><h3 class="h6 text-uppercase text-body-secondary mb-1">Radiation Tube Setup</h3></div>
+          <div class="col-md-6">
+            <label class="form-label">Tube Type</label>
+            <select class="form-select">
+              <option selected>SBM-19 — 350–475 V, 0.001500 µSv/h per CPM</option>
+              <option>SBM-20 — 350–475 V, 0.006315 µSv/h per CPM</option>
+              <option>STS-5 — 350–475 V, 0.006315 µSv/h per CPM</option>
+              <option>SBT-10 — 350–450 V, 0.013500 µSv/h per CPM</option>
+              <option>STS-6 — 380–475 V, 0.006315 µSv/h per CPM</option>
+              <option>SI-22G — 380–475 V, 0.001714 µSv/h per CPM</option>
+              <option>LND-712 — 500–600 V, 0.005940 µSv/h per CPM</option>
+              <option>LND-7317 — 450–550 V, 0.002100 µSv/h per CPM</option>
+              <option>SI-3BG — 380–475 V, 0.006315 µSv/h per CPM</option>
+              <option>Custom</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Dead Time (us)</label>
+            <input class="form-control mono" value="250.000" readonly>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Conversion Factor</label>
+            <input class="form-control mono" value="0.001500" readonly>
+          </div>
+          <div class="col-12">
+            <div class="border rounded-3 p-3 bg-body-tertiary">
+              <div class="fw-semibold mb-1">Active tube profile</div>
+              <div class="hint">Current runtime selection: <span class="mono">SBM-19</span><br>Operating range: <span class="mono">350–475 V</span><br>Low-sensitivity tube preset used as the project default.</div>
+            </div>
+          </div>
+
+          <!-- Buttons -->
+          <div class="col-12 d-flex flex-wrap gap-2 pt-2">
+            <button type="button" class="btn btn-primary">Save Settings</button>
+            <button type="button" class="btn btn-warning">Save and Reboot</button>
+            <button type="button" class="btn btn-outline-secondary">Reboot Only</button>
+            <a class="btn btn-outline-secondary" href="#">Review OTA Status</a>
+            <a class="btn btn-outline-secondary" href="#">Open OTA Update</a>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- NOTES COLUMN -->
+  <div class="col-12 col-xl-4">
+    <div class="card">
+      <div class="card-body">
+        <h2 class="h5 mb-3">Notes</h2>
+        <ul class="mb-0 ps-3 hint">
+          <li>WiFi and hostname changes need a reboot before they take effect.</li>
+          <li>Timezone, DST, calibration, and history settings are saved in NVS and can be adjusted without rebuilding the firmware.</li>
+          <li>Upload platforms can be disabled independently from this page if you only want local monitoring.</li>
+          <li>Credentials are stored in NVS on the device and are no longer limited to build-time secrets.</li>
+          <li>Tube presets live in <span class="mono">logger_user_config.h</span> so builders can ship cleaner defaults.</li>
+          <li>The compiled <span class="mono">arduino_secrets.h</span> values remain as fallback defaults.</li>
+          <li>The OTA update page is still served by the ElegantOTA library.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /row -->
+
+<footer>&copy; 2022&ndash;2026 &middot; By <a href="https://www.don-zalmrol.be/" target="_blank" rel="noopener">Don Zalmrol</a> &middot; <a href="https://github.com/DonZalmrol" target="_blank" rel="noopener">GitHub</a> &middot; <span class="mono">v1.4d</span></footer>
+</main>
+
+<script>
+document.getElementById('themeSelect').addEventListener('change',function(e){
+  document.body.setAttribute('data-theme',e.target.value);
+});
+</script>
+</body>
+</html>

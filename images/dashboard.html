@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>envlogger : Environmental Logger — Dashboard Preview</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#10161d;--bg-soft:#17212b;--card:#1c2733;--border:#334456;--text:#f3f7fb;--muted:#c5d1dd;--accent:#58a6ff;--accent-strong:#3d8bfd;--tableHead:#1b2833;--tableRow:#16202a;--chip:#1a2834;--gaugeBg:#314151;--shadow:rgba(0,0,0,.28);--heroA:#17324a;--heroB:#245e86;--surface:rgba(255,255,255,.08);color-scheme:dark;}
+body[data-theme="light"]{--bg:#eff4f8;--bg-soft:#f7fafc;--card:#ffffff;--border:#d4dee8;--text:#17212b;--muted:#5d6d7d;--accent:#1e6bd6;--accent-strong:#1451a8;--tableHead:#e5eef6;--tableRow:#f8fbfd;--chip:#eef3f7;--gaugeBg:#d8e1ea;--shadow:rgba(22,41,66,.12);--heroA:#ddebf7;--heroB:#f7fbff;--surface:rgba(255,255,255,.72);color-scheme:light;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:radial-gradient(circle at top,var(--heroA),var(--bg) 38%);color:var(--text);font-family:Segoe UI,Arial,sans-serif;}
+.page-shell{max-width:1240px;margin:0 auto;padding:20px 16px 28px;}
+.topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:12px 14px;border:1px solid var(--border);border-radius:18px;background:var(--surface);backdrop-filter:blur(12px);box-shadow:0 12px 28px var(--shadow);}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.02em;color:var(--text);}
+.brand-mark{width:34px;height:34px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;font-size:1rem;box-shadow:0 8px 18px rgba(33,109,214,.28);}
+.menu{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
+.menu-link{border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;padding:8px 12px;font-size:.84rem;font-weight:600;box-shadow:0 8px 20px var(--shadow);}
+.menu-link.active{background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;border-color:transparent;}
+.hero{padding:24px;border:1px solid var(--border);border-radius:24px;background:linear-gradient(135deg,var(--surface),rgba(255,255,255,.02)),linear-gradient(135deg,var(--heroA),var(--heroB));box-shadow:0 20px 40px var(--shadow);margin-bottom:18px;}
+.hero h1{text-align:left;color:var(--text);margin-bottom:6px;font-size:clamp(1.7rem,3vw,2.5rem);}
+.hero-lead{color:var(--muted);font-size:.92rem;margin-bottom:10px;}
+.hero-meta{display:flex;flex-wrap:wrap;gap:8px;}
+.hero-chip{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:var(--chip);font-size:.82rem;color:var(--text);}
+.theme-picker{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:8px 12px;box-shadow:0 6px 18px var(--shadow);}
+.theme-picker label{font-size:.8rem;color:var(--muted);font-weight:700;letter-spacing:.04em;text-transform:uppercase;}
+.theme-picker select{background:var(--bg-soft);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:6px 10px;font:inherit;outline:none;}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-bottom:20px;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:14px;box-shadow:0 16px 34px var(--shadow);}
+.card-title{font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;}
+.card-value{font-size:2rem;font-weight:700;line-height:1;}
+.card-unit{font-size:.8rem;color:var(--muted);margin-top:2px;}
+.gauge-bg{background:var(--gaugeBg);border-radius:4px;height:8px;margin-top:10px;overflow:hidden;}
+.gauge-fill{height:100%;border-radius:4px;transition:width .4s;}
+.chart-card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:14px;margin-bottom:14px;box-shadow:0 16px 34px var(--shadow);}
+.chart-card h3{font-size:.85rem;color:var(--muted);margin-bottom:10px;}
+section{margin-bottom:20px;}
+h2{color:var(--accent);font-size:1rem;margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:4px;}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72rem;font-weight:700;}
+.badge-ok{background:#1b5e20;color:#a5d6a7;}
+.badge-err{background:#b71c1c;color:#ef9a9a;}
+.badge-neutral{background:#37474f;color:#cfd8dc;}
+footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted);border-top:1px solid var(--border);margin-top:28px;}
+a{color:var(--accent);}
+</style>
+</head>
+<body>
+<main class="page-shell">
+
+<!-- TOPBAR -->
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">&#9762;</span><span>Environmental Logger</span></div>
+  <nav class="menu">
+    <a class="menu-link active" href="#">Dashboard</a>
+    <a class="menu-link" href="graphs.html">Graphs</a>
+    <a class="menu-link" href="config.html">Config</a>
+    <div class="theme-picker">
+      <label for="themeSelect">Theme</label>
+      <select id="themeSelect"><option value="dark">Dark</option><option value="light">Light</option></select>
+    </div>
+  </nav>
+</header>
+
+<!-- HERO -->
+<section class="hero">
+  <h1>Station Dashboard</h1>
+  <p class="hero-lead">Live environmental, radiation, storage, and upload telemetry from the ESP32 station.</p>
+  <div class="hero-meta">
+    <span class="hero-chip">2026-04-19  |  14:32:07</span>
+    <span class="hero-chip">cycle 47 / 60</span>
+    <span class="hero-chip">uptime 3 days, 07:14</span>
+  </div>
+</section>
+
+<!-- RADIATION -->
+<section>
+  <h2>&#9762; Radiation</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">Dose Rate</div>
+      <div class="card-value" style="color:#4caf50">0.0270</div>
+      <div class="card-unit">µSv/h</div>
+      <div class="gauge-bg"><div class="gauge-fill" style="width:3%;background:#4caf50"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">CPM (2-tube avg, 120 s)</div>
+      <div class="card-value">18</div>
+      <div class="card-unit">counts per minute</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Tube 1 CPS</div>
+      <div class="card-value">0</div>
+      <div class="card-unit">counts / s</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Tube 2 CPS</div>
+      <div class="card-value">0</div>
+      <div class="card-unit">counts / s</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Tube 1 CPM</div>
+      <div class="card-value">9</div>
+      <div class="card-unit">counts per minute</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Tube 2 CPM</div>
+      <div class="card-value">9</div>
+      <div class="card-unit">counts per minute</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Tube High Voltage</div>
+      <div class="card-value" style="color:#4caf50">392.3</div>
+      <div class="card-unit">V</div>
+      <div class="gauge-bg"><div class="gauge-fill" style="width:78%;background:#4caf50"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">HV Drive Index</div>
+      <div class="card-value" style="color:#4caf50">76.4</div>
+      <div class="card-unit">% est.</div>
+      <div class="gauge-bg"><div class="gauge-fill" style="width:76%;background:#4caf50"></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- AIR QUALITY -->
+<section>
+  <h2>&#127807; Air Quality</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">IAQ — Calibrated</div>
+      <div class="card-value" style="color:#4caf50">48.2</div>
+      <div class="card-unit">/ 500</div>
+      <div class="gauge-bg"><div class="gauge-fill" style="width:10%;background:#4caf50"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">CO₂</div>
+      <div class="card-value">412</div>
+      <div class="card-unit">ppm</div>
+      <div class="gauge-bg"><div class="gauge-fill" style="width:3%;background:#ff9800"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">VOC (gas resistance)</div>
+      <div class="card-value">94.2</div>
+      <div class="card-unit">kΩ</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Formaldehyde (CH₂O)</div>
+      <div class="card-value">0.012</div>
+      <div class="card-unit">ppm</div>
+    </div>
+    <div class="card">
+      <div class="card-title">PM 1.0</div>
+      <div class="card-value">3</div>
+      <div class="card-unit">µg/m³</div>
+    </div>
+    <div class="card">
+      <div class="card-title">PM 2.5</div>
+      <div class="card-value">5</div>
+      <div class="card-unit">µg/m³</div>
+    </div>
+    <div class="card">
+      <div class="card-title">PM 10</div>
+      <div class="card-value">6</div>
+      <div class="card-unit">µg/m³</div>
+    </div>
+  </div>
+</section>
+
+<!-- ENVIRONMENT -->
+<section>
+  <h2>&#127777; Environment</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">Temperature</div>
+      <div class="card-value">21.3</div>
+      <div class="card-unit">°C</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Pressure</div>
+      <div class="card-value">1013.2</div>
+      <div class="card-unit">hPa</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Humidity</div>
+      <div class="card-value">55.2</div>
+      <div class="card-unit">% RH</div>
+      <div class="gauge-bg"><div class="gauge-fill" style="width:55%;background:#64b5f6"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Luminosity</div>
+      <div class="card-value">47</div>
+      <div class="card-unit">lux</div>
+    </div>
+  </div>
+</section>
+
+<!-- RESOURCES -->
+<section>
+  <h2>&#9881; Resources</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">CPU Core 0</div>
+      <div class="card-value">12.4</div>
+      <div class="card-unit">% busy</div>
+    </div>
+    <div class="card">
+      <div class="card-title">CPU Core 1</div>
+      <div class="card-value">3.1</div>
+      <div class="card-unit">% busy</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Free Heap</div>
+      <div class="card-value">229.4</div>
+      <div class="card-unit">229.4 / 327.7 kB (70.0% free)</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Disk Space</div>
+      <div class="card-value">148.0</div>
+      <div class="card-unit">148.0 / 192.0 kB (77.1% free)</div>
+    </div>
+    <div class="card">
+      <div class="card-title">WiFi</div>
+      <div class="card-value">-61 dBm</div>
+      <div class="card-unit">connected</div>
+    </div>
+  </div>
+</section>
+
+<!-- UPLOAD STATUS -->
+<section>
+  <h2>&#8679; Upload Status</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">radmon.org</div>
+      <div class="card-value" style="font-size:1.1rem"><span class="badge badge-ok">HTTP 200</span></div>
+      <div class="card-unit" style="margin-top:6px">CPM: 18 &nbsp;|&nbsp; 14:31:07</div>
+    </div>
+    <div class="card">
+      <div class="card-title">uRADMonitor</div>
+      <div class="card-value" style="font-size:1.1rem"><span class="badge badge-ok">HTTP 200</span></div>
+      <div class="card-unit" style="margin-top:6px">CPM: 18 &nbsp;|&nbsp; 14:31:07</div>
+    </div>
+  </div>
+</section>
+
+<!-- LIVE CHARTS -->
+<div class="chart-card"><h3>Dose Rate</h3><canvas id="cDose" height="80"></canvas></div>
+<div class="chart-card"><h3>CPM</h3><canvas id="cCpm" height="80"></canvas></div>
+<div class="chart-card"><h3>CPS per Tube</h3><canvas id="cCps" height="80"></canvas></div>
+<div class="chart-card"><h3>Temperature, Humidity &amp; Pressure</h3><canvas id="cTH" height="80"></canvas></div>
+<div class="chart-card"><h3>IAQ</h3><canvas id="cIaq" height="80"></canvas></div>
+<div class="chart-card"><h3>CO₂</h3><canvas id="cCo2" height="80"></canvas></div>
+<div class="chart-card"><h3>Particulates</h3><canvas id="cPm" height="80"></canvas></div>
+
+<footer>&copy; 2022&ndash;2026 &middot; By <a href="https://www.don-zalmrol.be/" target="_blank" rel="noopener">Don Zalmrol</a> &middot; <a href="https://github.com/DonZalmrol" target="_blank" rel="noopener">GitHub</a> &middot; <span style="font-family:monospace">v1.4d</span></footer>
+</main>
+
+<script>
+(function(){
+  // Theme picker
+  var sel = document.getElementById('themeSelect');
+  sel.addEventListener('change', function(){ document.body.setAttribute('data-theme', sel.value); });
+
+  // Generate dummy time-series data (60 points, last 60 seconds)
+  var now = Date.now();
+  var labels = [];
+  for(var i=59;i>=0;i--) {
+    var d=new Date(now - i*1000);
+    labels.push(d.getHours()+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0'));
+  }
+  function noise(base, amp){ return Array.from({length:60},function(_,i){return +(base + amp*(Math.sin(i/6)+Math.random()*0.4-0.2)).toFixed(4);}); }
+  function noiseInt(base, amp){ return Array.from({length:60},function(_,i){return Math.round(base + amp*(Math.sin(i/7)+Math.random()*0.5-0.25));}); }
+
+  var palette={dose:'#f44336',cpm:'#ff9800',tube1:'#ce93d8',tube2:'#80cbc4',
+    temp:'#ef5350',humidity:'#42a5f5',pressure:'#26c6da',
+    iaq:'#ab47bc',co2:'#26a69a',pm1:'#aed581',pm25:'#ffca28',pm10:'#ef5350',
+    grid:'#334456',text:'#c5d1dd'};
+
+  function mkChart(id, datasets, y2) {
+    var scales = {
+      x:{ticks:{color:palette.text,maxTicksLimit:8},grid:{color:palette.grid}},
+      y:{ticks:{color:palette.text},grid:{color:palette.grid}}
+    };
+    if(y2) scales.y2={position:'right',ticks:{color:palette.text},grid:{drawOnChartArea:false}};
+    return new Chart(document.getElementById(id),{
+      type:'line',
+      data:{labels:labels,datasets:datasets},
+      options:{responsive:true,animation:false,interaction:{mode:'index',intersect:false},
+        scales:scales,plugins:{legend:{labels:{color:palette.text}}}}
+    });
+  }
+  function ds(label,color,data,yid){ return {label:label,data:data,borderColor:color,backgroundColor:color+'22',fill:false,tension:.22,pointRadius:0,borderWidth:2,yAxisID:yid||'y'}; }
+
+  mkChart('cDose',[ds('Dose µSv/h',palette.dose,noise(.027,.004)),ds('CPM',palette.cpm,noiseInt(18,3))]);
+  mkChart('cCpm',[ds('Combined CPM',palette.cpm,noiseInt(18,3)),ds('Tube 1 CPM',palette.tube1,noiseInt(9,2)),ds('Tube 2 CPM',palette.tube2,noiseInt(9,2))]);
+  mkChart('cCps',[ds('Tube 1 CPS',palette.tube1,noiseInt(0,1)),ds('Tube 2 CPS',palette.tube2,noiseInt(0,1)),ds('CPS Avg',palette.cpm,noise(.3,.1))]);
+  mkChart('cTH',[
+    ds('Temp °C',palette.temp,noise(21.3,0.3)),
+    ds('Humidity %',palette.humidity,noise(55.2,1.5)),
+    ds('Pressure hPa',palette.pressure,noise(1013.2,0.8),'y2')
+  ],true);
+  mkChart('cIaq',[ds('IAQ',palette.iaq,noise(48.2,4))]);
+  mkChart('cCo2',[ds('CO2 ppm',palette.co2,noise(412,12))]);
+  mkChart('cPm',[ds('PM1.0',palette.pm1,noiseInt(3,1)),ds('PM2.5',palette.pm25,noiseInt(5,1)),ds('PM10',palette.pm10,noiseInt(6,2))]);
+})();
+</script>
+</body>
+</html>
