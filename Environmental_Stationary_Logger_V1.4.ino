@@ -227,6 +227,7 @@ static const int UPLOAD_STATUS_MISSING_CONFIG = -11;
 // 360 minutes (6 hours) = saving 4 times a day
 //#define STATE_SAVE_PERIOD UINT32_C(360 * 60 * 1000) 
 const unsigned long STATE_SAVE_PERIOD = (1UL * 60UL * 1000UL);
+static constexpr size_t EXTRA_EXP_SENSOR_COUNT = 8;
 
 // Snapshot struct passed to the updateState FreeRTOS task to avoid Core 0/1 race on BSEC globals
 struct StateSnapshot {
@@ -237,6 +238,7 @@ struct StateSnapshot {
 // Snapshot struct passed to the upload FreeRTOS task to avoid race conditions on globals
 struct UploadSnapshot {
   unsigned long cpm;
+  unsigned long cpm1;
   unsigned long actual_cps_1;
   unsigned long actual_cps_2;
   float tubeVoltage;
@@ -251,6 +253,7 @@ struct UploadSnapshot {
   int var_pm01;
   int var_pm25;
   int var_pm10;
+  float extraExpValues[EXTRA_EXP_SENSOR_COUNT];
 };
 
 struct UploadRecord {
@@ -284,12 +287,14 @@ static void WiFiSetup(void);
 static uint64_t getUptimeSeconds(void);
 static String formatUptime(uint64_t uptimeSeconds);
 float outputSieverts(float cpmValue);
+static float currentOutputSieverts(void);
 float displayTubeVoltage(void);
 float calculateHCHO(void);
 static void uploadTaskFunction(void *parameter);
 static void connectToRadMonLogger(UploadSnapshot *snap);
 static void connectToURadMonLogger(UploadSnapshot *snap);
 static void scanI2C(void);
+static String buildI2cDiscoveryHtml(void);
 static void loadState(void);
 static void updateStateFunction(void *parameter);
 static bool Init_PulseCounter_01(void);
@@ -302,7 +307,7 @@ static String uploadStatusText(int code);
 static float estimateHvDrivePct(float voltage);
 static float estimateHvDriveUploadPct(float voltage);
 static float movingAvgToCpm(movingAvg &avg);
-static unsigned long applyDeadTimeCorrection(int rawCps, const char *tubeLabel);
+static unsigned long applyDeadTimeCorrection(int rawCps, float deadTimeSeconds, const char *tubeLabel);
 static void refreshCpuLoadMetrics(void);
 static bool checkEspOk(const char *operation, esp_err_t errorCode);
 static void copyUploadRecord(UploadRecord &dst, const UploadSnapshot *src);
@@ -332,6 +337,15 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass);
 static void saveRuntimeSetting(Preferences &prefs, const char *key, const String &value);
 static const TubePresetDefinition *findTubePresetById(const String &presetId);
 static String normalizeTubePresetId(const String &presetId);
+static uint8_t getUradTubeTypeId(const String &presetId);
+static uint32_t normalizeExpSensorMask(const uint32_t &sensorMask);
+static bool isExpSensorEnabled(const uint32_t sensorMask, const uint32_t sensorFlag);
+static String buildExpToggleHtml(const char *fieldId, const char *label, bool enabled, const char *pinSetupKey, const String &pinSummary);
+static String buildEsp32PinOptionsHtml(const String &selectedPinValue, const int *allowedPins, const size_t allowedPinCount, const bool analogOnly);
+static bool isValidWroverI2cPin(const int pinNumber);
+static void initializeConfiguredExpInputs(void);
+static float readConfiguredExpSensorValue(size_t sensorIndex, float elapsedSeconds);
+static void IRAM_ATTR handleExtraExpPulse(void *argument);
 static String normalizeDstProfileId(const String &profileId);
 static String buildDstProfileOptionsHtml(const String &selectedProfileId);
 static String dstProfileLabel(const String &profileId);
@@ -359,6 +373,81 @@ String JsonPage(void);
 #define VERBOSE_SERIAL_PRINT(...) do { if (serialVerboseEnabled) { Serial.print(__VA_ARGS__); } } while (0)
 #define VERBOSE_SERIAL_PRINTLN(...) do { if (serialVerboseEnabled) { Serial.println(__VA_ARGS__); } } while (0)
 
+// EXP fields supported by uRADMonitor. The mandatory 01 timestamp stays on by default.
+enum ExpSensorFlag : uint32_t {
+  EXP_SENSOR_TIME = 1 << 0,
+  EXP_SENSOR_TEMPERATURE = 1 << 1,
+  EXP_SENSOR_PRESSURE = 1 << 2,
+  EXP_SENSOR_HUMIDITY = 1 << 3,
+  EXP_SENSOR_ILLUMINANCE = 1 << 4,
+  EXP_SENSOR_VOC = 1 << 5,
+  EXP_SENSOR_CO2 = 1 << 6,
+  EXP_SENSOR_CH2O = 1 << 7,
+  EXP_SENSOR_PM25 = 1 << 8,
+  EXP_SENSOR_CPM = 1 << 9,
+  EXP_SENSOR_HV = 1 << 10,
+  EXP_SENSOR_HV_DUTY = 1 << 11,
+  EXP_SENSOR_TUBE_TYPE = 1 << 12,
+  EXP_SENSOR_PM1 = 1 << 13,
+  EXP_SENSOR_PM10 = 1 << 14,
+  EXP_SENSOR_HARDWARE_VERSION = 1 << 15,
+  EXP_SENSOR_FIRMWARE_VERSION = 1 << 16,
+  EXP_SENSOR_WIFI_SIGNAL = 1 << 17,
+  EXP_SENSOR_BATTERY = 1 << 18,
+  EXP_SENSOR_NOISE = 1 << 19,
+  EXP_SENSOR_OZONE = 1 << 20,
+  EXP_SENSOR_RADON = 1 << 21,
+  EXP_SENSOR_WIND_SPEED = 1 << 22,
+  EXP_SENSOR_WIND_DIRECTION = 1 << 23,
+  EXP_SENSOR_RAIN = 1 << 24,
+  EXP_SENSOR_IRRADIANCE = 1 << 25
+};
+
+enum class ExpExtraInputMode : uint8_t {
+  AnalogLinear,
+  PulseRate,
+  PulseTotal
+};
+
+struct ExpExtraSensorDefinition {
+  const char *key;
+  const char *label;
+  const char *unit;
+  uint8_t expFieldId;
+  uint32_t sensorFlag;
+  ExpExtraInputMode inputMode;
+};
+
+struct ExpExtraSensorConfig {
+  int pin;
+  float scale;
+  float offset;
+  bool configured;
+};
+
+static const ExpExtraSensorDefinition EXTRA_EXP_SENSOR_DEFINITIONS[] = {
+  {"battery", "Battery voltage (0A)", "V", 0x0A, EXP_SENSOR_BATTERY, ExpExtraInputMode::AnalogLinear},
+  {"noise", "Noise level (11)", "dB", 0x11, EXP_SENSOR_NOISE, ExpExtraInputMode::AnalogLinear},
+  {"ozone", "Ozone (14)", "ppb", 0x14, EXP_SENSOR_OZONE, ExpExtraInputMode::AnalogLinear},
+  {"radon", "Radon (15)", "Bq/m3", 0x15, EXP_SENSOR_RADON, ExpExtraInputMode::PulseRate},
+  {"wind_speed", "Wind speed (16)", "m/s", 0x16, EXP_SENSOR_WIND_SPEED, ExpExtraInputMode::PulseRate},
+  {"wind_direction", "Wind direction (17)", "degrees", 0x17, EXP_SENSOR_WIND_DIRECTION, ExpExtraInputMode::AnalogLinear},
+  {"rain", "Rain accumulation (18)", "mm", 0x18, EXP_SENSOR_RAIN, ExpExtraInputMode::PulseTotal},
+  {"irradiance", "Irradiance (19)", "W/m2", 0x19, EXP_SENSOR_IRRADIANCE, ExpExtraInputMode::AnalogLinear}
+};
+
+static ExpExtraSensorConfig extraExpSensorConfigs[EXTRA_EXP_SENSOR_COUNT] = {
+  {-1, 1.0f, 0.0f, false}, {-1, 1.0f, 0.0f, false},
+  {-1, 1.0f, 0.0f, false}, {-1, 1.0f, 0.0f, false},
+  {-1, 1.0f, 0.0f, false}, {-1, 1.0f, 0.0f, false},
+  {-1, 1.0f, 0.0f, false}, {-1, 1.0f, 0.0f, false}
+};
+static volatile uint32_t extraExpPulseCounts[EXTRA_EXP_SENSOR_COUNT] = {};
+static portMUX_TYPE extraExpPulseMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t lastExtraExpSampleMillis = 0;
+
+static const uint32_t DEFAULT_EXP_SENSOR_MASK = EXP_SENSOR_TIME | EXP_SENSOR_CPM;
+
 // Variables
 int increaseSecCount = 1, var_iaqAccuracy = 0, var_pm01 = 0, var_pm25 = 0, var_pm10 = 0, luminosity = 0;
 float var_iaq = 0.0;
@@ -368,12 +457,14 @@ float cpuLoadCore0Pct = 0.0f, cpuLoadCore1Pct = 0.0f;
 
 //unsigned long cps_1 = 0, cps_2 = 0;
 int cps_1 = 0, cps_2 = 0;
+unsigned long raw_cps_1 = 0, raw_cps_2 = 0;
 unsigned long actual_cps_1 = 0, actual_cps_2 = 0;
 unsigned long cpm = 0, cpm1 = 0, cpm2 = 0;
 unsigned long sensorMovingAvg = 0;
 unsigned long previousMillis_1 = 0, previousMillis_2 = 0, previousMillis_3 = 0;
 uint32_t loopWindowStartUs = 0, loopBusyUs = 0;
 int i2cDevicesFound = 0;
+uint8_t i2cDeviceAddresses[126] = {};
 bool spiffsMounted = false;
 bool pmSensorAvailable = false;
 bool pulseCountersReady = false;
@@ -387,6 +478,13 @@ float activeTubeConversionFactor = LOGGER_DEFAULT_TUBE_CONVERSION_FACTOR_USV_PER
 float activeTubeOperatingVoltageMin = 0.0f;
 float activeTubeOperatingVoltageMax = 0.0f;
 String activeTubePresetNote = String("Custom values are saved in NVS; verify the operating voltage range against your tube datasheet.");
+String activeTube2PresetId = String(LOGGER_DEFAULT_TUBE_PRESET_ID);
+String activeTube2PresetLabel = String(CUSTOM_TUBE_PRESET_LABEL);
+float activeTube2DeadTimeSeconds = LOGGER_DEFAULT_TUBE_DEAD_TIME_SECONDS;
+float activeTube2ConversionFactor = LOGGER_DEFAULT_TUBE_CONVERSION_FACTOR_USV_PER_CPM;
+float activeTube2OperatingVoltageMin = 0.0f;
+float activeTube2OperatingVoltageMax = 0.0f;
+String activeTube2PresetNote = String("Custom values are saved in NVS; verify the operating voltage range against your tube datasheet.");
 int activeTimezoneOffsetMinutes = DEFAULT_TIMEZONE_OFFSET_MINUTES;
 int activeDstOffsetMinutes = DEFAULT_DST_OFFSET_MINUTES;
 String activeDstProfileId = String(DEFAULT_DST_PROFILE_ID);
@@ -398,6 +496,14 @@ bool activeURadmonUploadEnabled = true;
 String activeNtpServer = String(DEFAULT_NTP_SERVER);
 long activeCpmGaugeFullScale = DEFAULT_CPM_GAUGE_FULL_SCALE;
 String activeStationName = String(DEFAULT_STATION_NAME);
+bool activeDualTubeEnabled = true;
+uint32_t activeExpSensorMask = DEFAULT_EXP_SENSOR_MASK;
+int activeI2cSdaPin = 21;
+int activeI2cSclPin = 22;
+int activeHchoAdcPin = 34;
+int activeHvAdcPin = 33;
+int activeTube1PulsePin = 13;
+int activeTube2PulsePin = 14;
 
 // Create rolling windows: combined radiation over 120 s, per-tube over 60 s
 movingAvg cps_sensor(120);
@@ -517,7 +623,8 @@ void setup()
   }
 
   // Check if I2C bus is enabled
-  if(!Wire.begin())
+  loadRuntimeSettings();
+  if(!Wire.begin(activeI2cSdaPin, activeI2cSclPin))
   {
     Serial.println(F("I2C bus not initialized!"));
   }
@@ -526,8 +633,6 @@ void setup()
   {
     Serial.println(F("I2C bus is initialized."));
 
-    loadRuntimeSettings();
-  
     // Connect to the WiFi
     WiFiSetup();
 
@@ -564,14 +669,15 @@ void setup()
     cps_sensor_02.begin();
   
     // Initialize Arduino pins
-    pinMode(33, INPUT_PULLUP);  // Set pin33 (GPIO33) input for ADC1_CHANNEL_5
-    pinMode(34, INPUT_PULLUP);  // Set pin34 (GPIO34) input for HCHO sensor A
+    pinMode(activeHvAdcPin, INPUT_PULLUP);
+    pinMode(activeHchoAdcPin, INPUT_PULLUP);
     analogReadResolution(12);
-    analogSetPinAttenuation(33, ADC_11db);
-    analogSetPinAttenuation(34, ADC_11db);
+    analogSetPinAttenuation(activeHvAdcPin, ADC_11db);
+    analogSetPinAttenuation(activeHchoAdcPin, ADC_11db);
 
-    pinMode(13, INPUT_PULLUP);  // Set pin13 (GPIO13) input for capturing GM Tube 01 events (pulses)
-    pinMode(14, INPUT_PULLUP);  // Set pin14 (GPIO14) input for capturing GM Tube 02 events (pulses)
+    pinMode(activeTube1PulsePin, INPUT_PULLUP);
+    pinMode(activeTube2PulsePin, INPUT_PULLUP);
+    initializeConfiguredExpInputs();
 
     //pinMode(26, OUTPUT);      // Set pin04 (GPIO26) as output for LED
     //pinMode(25, OUTPUT);      // Set pin25 (GPIO25) as output for LED upload = OK
@@ -626,7 +732,7 @@ void setup()
 
     // Pulse Counter (PCNT)
     bool pcnt01Ready = Init_PulseCounter_01();
-    bool pcnt02Ready = Init_PulseCounter_02();
+    bool pcnt02Ready = (!activeDualTubeEnabled) ? true : Init_PulseCounter_02();
     pulseCountersReady = pcnt01Ready && pcnt02Ready;
     if (!pulseCountersReady)
     {
@@ -693,26 +799,47 @@ void loop()
       {
         cps_1 = 0;
       }
-      if (!checkEspOk("pcnt_unit_get_count tube 2", pcnt_unit_get_count(pcnt_unit_02, &cps_2)))
+      if (activeDualTubeEnabled)
+      {
+        if (!checkEspOk("pcnt_unit_get_count tube 2", pcnt_unit_get_count(pcnt_unit_02, &cps_2)))
+        {
+          cps_2 = 0;
+        }
+      }
+      else
       {
         cps_2 = 0;
       }
 
+      raw_cps_1 = (unsigned long)max(0, cps_1);
+      raw_cps_2 = (unsigned long)max(0, cps_2);
+
       // Clear counters immediately so the next 1-second read reflects only that second's pulses.
       checkEspOk("pcnt_unit_stop tube 1", pcnt_unit_stop(pcnt_unit_01));
-      checkEspOk("pcnt_unit_stop tube 2", pcnt_unit_stop(pcnt_unit_02));
+      if (activeDualTubeEnabled && (pcnt_unit_02 != NULL))
+      {
+        checkEspOk("pcnt_unit_stop tube 2", pcnt_unit_stop(pcnt_unit_02));
+      }
       checkEspOk("pcnt_unit_clear_count tube 1", pcnt_unit_clear_count(pcnt_unit_01));
-      checkEspOk("pcnt_unit_clear_count tube 2", pcnt_unit_clear_count(pcnt_unit_02));
+      if (activeDualTubeEnabled && (pcnt_unit_02 != NULL))
+      {
+        checkEspOk("pcnt_unit_clear_count tube 2", pcnt_unit_clear_count(pcnt_unit_02));
+      }
       checkEspOk("pcnt_unit_start tube 1", pcnt_unit_start(pcnt_unit_01));
-      checkEspOk("pcnt_unit_start tube 2", pcnt_unit_start(pcnt_unit_02));
+      if (activeDualTubeEnabled && (pcnt_unit_02 != NULL))
+      {
+        checkEspOk("pcnt_unit_start tube 2", pcnt_unit_start(pcnt_unit_02));
+      }
 
-      actual_cps_1 = applyDeadTimeCorrection(cps_1, "Tube 1");
-      actual_cps_2 = applyDeadTimeCorrection(cps_2, "Tube 2");
+      actual_cps_1 = applyDeadTimeCorrection(cps_1, activeTubeDeadTimeSeconds, "Tube 1");
+      actual_cps_2 = activeDualTubeEnabled ? applyDeadTimeCorrection(cps_2, activeTube2DeadTimeSeconds, "Tube 2") : 0UL;
     }
     else
     {
       cps_1 = 0;
       cps_2 = 0;
+      raw_cps_1 = 0;
+      raw_cps_2 = 0;
       actual_cps_1 = 0;
       actual_cps_2 = 0;
     }
@@ -731,7 +858,7 @@ void loop()
     sensorMovingAvg = (unsigned long)roundf(combinedCpm / 120.0f);
     cpm1            = (_avg1 > 0) ? (unsigned long)roundf(movingAvgToCpm(cps_sensor_01)) : 0UL;
     cpm2            = (_avg2 > 0) ? (unsigned long)roundf(movingAvgToCpm(cps_sensor_02)) : 0UL;
-    cpm             = (unsigned long)roundf(combinedCpm / 2.0f);
+    cpm             = (unsigned long)roundf(combinedCpm / (activeDualTubeEnabled ? 2.0f : 1.0f));
     
     VERBOSE_SERIAL_PRINTLN(F("--- 01 sec move ---"));
     VERBOSE_SERIAL_PRINTLN("| Tube 1 " + String(increaseSecCount) + " sec current count (cps_1) = " + String(actual_cps_1));
@@ -898,6 +1025,7 @@ void loop()
         else
         {
           snap->cpm             = cpm;
+          snap->cpm1            = cpm1;
           snap->actual_cps_1    = actual_cps_1;
           snap->actual_cps_2    = actual_cps_2;
           snap->tubeVoltage     = tubeVoltage;
@@ -912,6 +1040,18 @@ void loop()
           snap->var_pm01        = var_pm01;
           snap->var_pm25        = var_pm25;
           snap->var_pm10        = var_pm10;
+          uint32_t extraSampleMillis = millis();
+          float extraElapsedSeconds = (extraSampleMillis - lastExtraExpSampleMillis) / 1000.0f;
+          lastExtraExpSampleMillis = extraSampleMillis;
+          for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+          {
+            float value = extraExpSensorConfigs[sensorIndex].configured
+              ? readConfiguredExpSensorValue(sensorIndex, extraElapsedSeconds)
+              : 0.0f;
+            snap->extraExpValues[sensorIndex] = isExpSensorEnabled(activeExpSensorMask, EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].sensorFlag)
+              ? value
+              : 0.0f;
+          }
 
           // O1: guard against task creation failure — free snap if it fails
           if (xTaskCreatePinnedToCore
@@ -1061,6 +1201,19 @@ static void loadRuntimeSettings(void)
     activeNtpServer = String(DEFAULT_NTP_SERVER);
     activeCpmGaugeFullScale = DEFAULT_CPM_GAUGE_FULL_SCALE;
     activeStationName = String(DEFAULT_STATION_NAME);
+    activeDualTubeEnabled = true;
+    activeExpSensorMask = DEFAULT_EXP_SENSOR_MASK;
+    activeI2cSdaPin = 21;
+    activeI2cSclPin = 22;
+    activeHchoAdcPin = 34;
+    activeHvAdcPin = 33;
+    activeTube1PulsePin = 13;
+    activeTube2PulsePin = 14;
+    for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+    {
+      extraExpSensorConfigs[sensorIndex] = {-1, 1.0f, 0.0f, false};
+      extraExpPulseCounts[sensorIndex] = 0;
+    }
     activeTubePresetId = String(LOGGER_DEFAULT_TUBE_PRESET_ID);
     const TubePresetDefinition *defaultPreset = findTubePresetById(activeTubePresetId);
     if (defaultPreset != NULL)
@@ -1072,6 +1225,13 @@ static void loadRuntimeSettings(void)
       activeTubeOperatingVoltageMax = defaultPreset->operatingVoltageMax;
       activeTubePresetNote = String(defaultPreset->note);
     }
+    activeTube2PresetId = activeTubePresetId;
+    activeTube2PresetLabel = activeTubePresetLabel;
+    activeTube2DeadTimeSeconds = activeTubeDeadTimeSeconds;
+    activeTube2ConversionFactor = activeTubeConversionFactor;
+    activeTube2OperatingVoltageMin = activeTubeOperatingVoltageMin;
+    activeTube2OperatingVoltageMax = activeTubeOperatingVoltageMax;
+    activeTube2PresetNote = activeTubePresetNote;
     return;
   }
 
@@ -1095,6 +1255,44 @@ static void loadRuntimeSettings(void)
   activeNtpServer = settingsStore.getString("ntp_srv", String(DEFAULT_NTP_SERVER));
   activeCpmGaugeFullScale = (long)settingsStore.getInt("cpm_gauge", (int)DEFAULT_CPM_GAUGE_FULL_SCALE);
   activeStationName = settingsStore.getString("station_name", String(DEFAULT_STATION_NAME));
+  activeDualTubeEnabled = settingsStore.getBool("dual_tube", true);
+  activeExpSensorMask = normalizeExpSensorMask((uint32_t)settingsStore.getInt("exp_mask", (int)DEFAULT_EXP_SENSOR_MASK));
+  activeI2cSdaPin = settingsStore.getInt("i2c_sda", 21);
+  activeI2cSclPin = settingsStore.getInt("i2c_scl", 22);
+  activeHchoAdcPin = settingsStore.getInt("hcho_adc_pin", 34);
+  activeHvAdcPin = settingsStore.getInt("hv_adc_pin", 33);
+  activeTube1PulsePin = settingsStore.getInt("tube1_pin", 13);
+  activeTube2PulsePin = settingsStore.getInt("tube2_pin", 14);
+
+  if (!isValidWroverI2cPin(activeI2cSdaPin)) activeI2cSdaPin = 21;
+  if (!isValidWroverI2cPin(activeI2cSclPin)) activeI2cSclPin = 22;
+  if (activeI2cSdaPin == activeI2cSclPin)
+  {
+    activeI2cSdaPin = 21;
+    activeI2cSclPin = 22;
+  }
+  if (!isValidWroverAnalogInputPin(activeHchoAdcPin)) activeHchoAdcPin = 34;
+  if (!isValidWroverAnalogInputPin(activeHvAdcPin)) activeHvAdcPin = 33;
+  if (!isValidWroverInputPin(activeTube1PulsePin)) activeTube1PulsePin = 13;
+  if (!isValidWroverInputPin(activeTube2PulsePin)) activeTube2PulsePin = 14;
+
+  for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  {
+    String keyPrefix = String("ex_") + EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].key;
+    ExpExtraSensorConfig &sensorConfig = extraExpSensorConfigs[sensorIndex];
+    sensorConfig.pin = settingsStore.getInt((keyPrefix + "_pin").c_str(), -1);
+    sensorConfig.scale = settingsStore.getFloat((keyPrefix + "_scale").c_str(), 1.0f);
+    sensorConfig.offset = settingsStore.getFloat((keyPrefix + "_offset").c_str(), 0.0f);
+    bool analogMode = EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].inputMode == ExpExtraInputMode::AnalogLinear;
+    bool validPin = analogMode ? isValidWroverAnalogInputPin(sensorConfig.pin) : isValidWroverInputPin(sensorConfig.pin);
+    sensorConfig.configured = validPin && isfinite(sensorConfig.scale) && (sensorConfig.scale > 0.0f) && isfinite(sensorConfig.offset);
+    extraExpPulseCounts[sensorIndex] = 0;
+    if (!sensorConfig.configured)
+    {
+      activeExpSensorMask &= ~EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].sensorFlag;
+    }
+  }
+  activeExpSensorMask = normalizeExpSensorMask(activeExpSensorMask);
 
   if ((activeTimezoneOffsetMinutes < -720) || (activeTimezoneOffsetMinutes > 840))
   {
@@ -1160,6 +1358,31 @@ static void loadRuntimeSettings(void)
       activeTubeConversionFactor = LOGGER_DEFAULT_TUBE_CONVERSION_FACTOR_USV_PER_CPM;
     }
   }
+
+  String storedTube2PresetId = normalizeTubePresetId(settingsStore.getString("tube2_preset", activeTubePresetId));
+  const TubePresetDefinition *selectedTube2Preset = findTubePresetById(storedTube2PresetId);
+  if (selectedTube2Preset != NULL)
+  {
+    activeTube2PresetId = String(selectedTube2Preset->id);
+    activeTube2PresetLabel = String(selectedTube2Preset->label);
+    activeTube2DeadTimeSeconds = selectedTube2Preset->deadTimeSeconds;
+    activeTube2ConversionFactor = selectedTube2Preset->conversionFactorUsvPerCpm;
+    activeTube2OperatingVoltageMin = selectedTube2Preset->operatingVoltageMin;
+    activeTube2OperatingVoltageMax = selectedTube2Preset->operatingVoltageMax;
+    activeTube2PresetNote = String(selectedTube2Preset->note);
+  }
+  else
+  {
+    activeTube2PresetId = String(CUSTOM_TUBE_PRESET_ID);
+    activeTube2PresetLabel = String(CUSTOM_TUBE_PRESET_LABEL);
+    activeTube2DeadTimeSeconds = settingsStore.getFloat("tube2_dead", activeTubeDeadTimeSeconds);
+    activeTube2ConversionFactor = settingsStore.getFloat("tube2_conv", activeTubeConversionFactor);
+    activeTube2OperatingVoltageMin = 0.0f;
+    activeTube2OperatingVoltageMax = 0.0f;
+    activeTube2PresetNote = String("Custom tube 2 values are saved in NVS; verify against its datasheet.");
+    if (activeTube2DeadTimeSeconds <= 0.0f) activeTube2DeadTimeSeconds = activeTubeDeadTimeSeconds;
+    if (activeTube2ConversionFactor <= 0.0f) activeTube2ConversionFactor = activeTubeConversionFactor;
+  }
   settingsStore.end();
 
   Serial.println("Runtime config loaded. Hostname=" + my_hostname + ", WiFi SSID=" + my_ssid + ", tube=" + activeTubePresetLabel + ", timezone=" + formatUtcOffsetMinutes(activeTimezoneOffsetMinutes));
@@ -1199,8 +1422,11 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   String uradUserKey = server.arg("urad_user_key");
   String uradDeviceId = server.arg("urad_device_id");
   String tubePresetId = normalizeTubePresetId(server.arg("tube_preset"));
+  String tube2PresetId = server.hasArg("tube2_preset") ? normalizeTubePresetId(server.arg("tube2_preset")) : activeTube2PresetId;
   String tubeDeadTimeUs = server.arg("tube_dead_time_us");
   String tubeConversionFactorValue = server.arg("tube_conversion_factor");
+  String tube2DeadTimeUs = server.hasArg("tube2_dead_time_us") ? server.arg("tube2_dead_time_us") : String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
+  String tube2ConversionFactorValue = server.hasArg("tube2_conversion_factor") ? server.arg("tube2_conversion_factor") : String(activeTube2ConversionFactor, 6);
   String timezoneOffsetValue = server.arg("timezone_offset_minutes");
   String dstProfileValue = normalizeDstProfileId(server.arg("dst_profile"));
   String dstOffsetValue = server.arg("dst_offset_minutes");
@@ -1210,12 +1436,19 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   String ntpServerValue = server.arg("ntp_server");
   String cpmGaugeFullScaleValue = server.arg("cpm_gauge_full_scale");
   String stationNameValue = server.arg("station_name");
+  String hchoPinValue = server.arg("hcho_adc_pin");
+  String hvPinValue = server.arg("hv_adc_pin");
+  String i2cSdaPinValue = server.arg("i2c_sda_pin");
+  String i2cSclPinValue = server.arg("i2c_scl_pin");
+  String tube1PinValue = server.arg("tube1_pin");
+  String tube2PinValue = server.arg("tube2_pin");
   bool resetWifiPassword = server.hasArg("wifi_password_reset");
   bool resetRadmonPassword = server.hasArg("radmon_password_reset");
   bool resetURadUserKey = server.hasArg("urad_user_key_reset");
   bool serialVerbose = server.hasArg("serial_verbose");
   bool radmonUploadEnabled = server.hasArg("radmon_upload_enabled");
   bool uradmonUploadEnabled = server.hasArg("urad_upload_enabled");
+  bool dualTubeEnabled = server.hasArg("dual_tube_enabled");
 
   wifiSsid.trim();
   wifiPassword.trim();
@@ -1227,6 +1460,8 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   uradDeviceId.trim();
   tubeDeadTimeUs.trim();
   tubeConversionFactorValue.trim();
+  tube2DeadTimeUs.trim();
+  tube2ConversionFactorValue.trim();
   timezoneOffsetValue.trim();
   dstOffsetValue.trim();
   hvCalibrationValue.trim();
@@ -1235,9 +1470,126 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   ntpServerValue.trim();
   cpmGaugeFullScaleValue.trim();
   stationNameValue.trim();
+  hchoPinValue.trim();
+  hvPinValue.trim();
+  i2cSdaPinValue.trim();
+  i2cSclPinValue.trim();
+  tube1PinValue.trim();
+  tube2PinValue.trim();
+
+  int requestedI2cSdaPin = i2cSdaPinValue.length() > 0 ? i2cSdaPinValue.toInt() : activeI2cSdaPin;
+  int requestedI2cSclPin = i2cSclPinValue.length() > 0 ? i2cSclPinValue.toInt() : activeI2cSclPin;
+  int requestedHchoPin = hchoPinValue.length() > 0 ? hchoPinValue.toInt() : activeHchoAdcPin;
+  int requestedHvPin = hvPinValue.length() > 0 ? hvPinValue.toInt() : activeHvAdcPin;
+  int requestedTube1Pin = tube1PinValue.length() > 0 ? tube1PinValue.toInt() : activeTube1PulsePin;
+  int requestedTube2Pin = tube2PinValue.length() > 0 ? tube2PinValue.toInt() : activeTube2PulsePin;
+
+  uint32_t requestedExpSensorMask = DEFAULT_EXP_SENSOR_MASK;
+  requestedExpSensorMask = EXP_SENSOR_TIME;
+  if (server.hasArg("exp_sensor_temperature")) requestedExpSensorMask |= EXP_SENSOR_TEMPERATURE;
+  if (server.hasArg("exp_sensor_pressure")) requestedExpSensorMask |= EXP_SENSOR_PRESSURE;
+  if (server.hasArg("exp_sensor_humidity")) requestedExpSensorMask |= EXP_SENSOR_HUMIDITY;
+  if (server.hasArg("exp_sensor_illuminance")) requestedExpSensorMask |= EXP_SENSOR_ILLUMINANCE;
+  if (server.hasArg("exp_sensor_voc")) requestedExpSensorMask |= EXP_SENSOR_VOC;
+  if (server.hasArg("exp_sensor_co2")) requestedExpSensorMask |= EXP_SENSOR_CO2;
+  if (server.hasArg("exp_sensor_ch2o")) requestedExpSensorMask |= EXP_SENSOR_CH2O;
+  if (server.hasArg("exp_sensor_pm25")) requestedExpSensorMask |= EXP_SENSOR_PM25;
+  if (server.hasArg("exp_sensor_cpm")) requestedExpSensorMask |= EXP_SENSOR_CPM;
+  if (server.hasArg("exp_sensor_hv")) requestedExpSensorMask |= EXP_SENSOR_HV;
+  if (server.hasArg("exp_sensor_hv_duty")) requestedExpSensorMask |= EXP_SENSOR_HV_DUTY;
+  if (server.hasArg("exp_sensor_tube_type")) requestedExpSensorMask |= EXP_SENSOR_TUBE_TYPE;
+  if (server.hasArg("exp_sensor_pm1")) requestedExpSensorMask |= EXP_SENSOR_PM1;
+  if (server.hasArg("exp_sensor_pm10")) requestedExpSensorMask |= EXP_SENSOR_PM10;
+  if (server.hasArg("exp_sensor_hardware_version")) requestedExpSensorMask |= EXP_SENSOR_HARDWARE_VERSION;
+  if (server.hasArg("exp_sensor_firmware_version")) requestedExpSensorMask |= EXP_SENSOR_FIRMWARE_VERSION;
+  if (server.hasArg("exp_sensor_wifi_signal")) requestedExpSensorMask |= EXP_SENSOR_WIFI_SIGNAL;
+  for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  {
+    if (server.hasArg((String("exp_sensor_") + EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].key).c_str()))
+    {
+      requestedExpSensorMask |= EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].sensorFlag;
+    }
+  }
+
+  ExpExtraSensorConfig requestedExtraSensorConfigs[EXTRA_EXP_SENSOR_COUNT];
+  for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  {
+    const ExpExtraSensorDefinition &sensorDefinition = EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex];
+    String fieldPrefix = String("exp_") + sensorDefinition.key;
+    String pinValue = server.arg(fieldPrefix + "_pin");
+    String scaleValue = server.arg(fieldPrefix + "_scale");
+    String offsetValue = server.arg(fieldPrefix + "_offset");
+    pinValue.trim();
+    scaleValue.trim();
+    offsetValue.trim();
+
+    ExpExtraSensorConfig &requestedConfig = requestedExtraSensorConfigs[sensorIndex];
+    requestedConfig = extraExpSensorConfigs[sensorIndex];
+    requestedConfig.configured = false;
+    if (pinValue.length() == 0)
+    {
+      requestedConfig.pin = -1;
+      requestedConfig.scale = 1.0f;
+      requestedConfig.offset = 0.0f;
+      if ((requestedExpSensorMask & sensorDefinition.sensorFlag) != 0)
+      {
+        notice = "Configure a GPIO and calibration for each selected extra EXP sensor.";
+        noticeClass = "danger";
+        return false;
+      }
+      continue;
+    }
+
+    requestedConfig.pin = pinValue.toInt();
+    bool analogMode = sensorDefinition.inputMode == ExpExtraInputMode::AnalogLinear;
+    bool validPin = analogMode ? isValidWroverAnalogInputPin(requestedConfig.pin) : isValidWroverInputPin(requestedConfig.pin);
+    if (!validPin)
+    {
+      notice = String(sensorDefinition.label) + (analogMode ? " requires an ESP32 ADC1 input pin." : " requires a supported digital input pin.");
+      noticeClass = "danger";
+      return false;
+    }
+    if (!parseFloatFieldInRange(scaleValue, requestedConfig.scale, 0.000001f, 1000000.0f))
+    {
+      notice = String("Enter a positive calibration scale for ") + sensorDefinition.label + ".";
+      noticeClass = "danger";
+      return false;
+    }
+    if (!parseFloatFieldInRange(offsetValue, requestedConfig.offset, -1000000.0f, 1000000.0f))
+    {
+      notice = String("Enter a valid calibration offset for ") + sensorDefinition.label + ".";
+      noticeClass = "danger";
+      return false;
+    }
+    requestedConfig.configured = true;
+
+    int reservedPins[] = {requestedI2cSdaPin, requestedI2cSclPin, requestedHchoPin, requestedHvPin, requestedTube1Pin, requestedTube2Pin};
+    size_t reservedPinCount = dualTubeEnabled ? 6U : 5U;
+    for (size_t pinIndex = 0; pinIndex < reservedPinCount; ++pinIndex)
+    {
+      if (requestedConfig.pin == reservedPins[pinIndex])
+      {
+        notice = String(sensorDefinition.label) + " cannot share a GPIO with an existing sensor input.";
+        noticeClass = "danger";
+        return false;
+      }
+    }
+    for (size_t previousIndex = 0; previousIndex < sensorIndex; ++previousIndex)
+    {
+      if (requestedExtraSensorConfigs[previousIndex].configured
+          && (requestedExtraSensorConfigs[previousIndex].pin == requestedConfig.pin))
+      {
+        notice = "Each enabled EXP sensor input needs its own GPIO.";
+        noticeClass = "danger";
+        return false;
+      }
+    }
+  }
 
   float customDeadTimeUs = 0.0f;
   float customConversionFactor = 0.0f;
+  float customTube2DeadTimeUs = 0.0f;
+  float customTube2ConversionFactor = 0.0f;
   long parsedTimezoneOffset = DEFAULT_TIMEZONE_OFFSET_MINUTES;
   long parsedDstOffset = DEFAULT_DST_OFFSET_MINUTES;
   long parsedHistoryRetentionHours = (long)DEFAULT_HISTORY_RETENTION_HOURS;
@@ -1281,6 +1633,52 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     noticeClass = "danger";
     return false;
   }
+  if ((hchoPinValue.length() > 0) && !isValidWroverAnalogInputPin(hchoPinValue.toInt()))
+  {
+    notice = "HCHO ADC pin is outside the ESP32 Wrover-E ADC1 range.";
+    noticeClass = "danger";
+    return false;
+  }
+  if ((hvPinValue.length() > 0) && !isValidWroverAnalogInputPin(hvPinValue.toInt()))
+  {
+    notice = "High-voltage ADC pin is outside the ESP32 Wrover-E ADC1 range.";
+    noticeClass = "danger";
+    return false;
+  }
+  if ((i2cSdaPinValue.length() > 0) && !isValidWroverI2cPin(i2cSdaPinValue.toInt()))
+  {
+    notice = "I2C SDA pin must be an output-capable ESP32 Wrover-E GPIO.";
+    noticeClass = "danger";
+    return false;
+  }
+  if ((i2cSclPinValue.length() > 0) && !isValidWroverI2cPin(i2cSclPinValue.toInt()))
+  {
+    notice = "I2C SCL pin must be an output-capable ESP32 Wrover-E GPIO.";
+    noticeClass = "danger";
+    return false;
+  }
+  if ((requestedI2cSdaPin == requestedI2cSclPin)
+      || (requestedI2cSdaPin == requestedHchoPin) || (requestedI2cSdaPin == requestedHvPin)
+      || (requestedI2cSclPin == requestedHchoPin) || (requestedI2cSclPin == requestedHvPin)
+      || (requestedI2cSdaPin == requestedTube1Pin) || (requestedI2cSclPin == requestedTube1Pin)
+      || (dualTubeEnabled && ((requestedI2cSdaPin == requestedTube2Pin) || (requestedI2cSclPin == requestedTube2Pin))))
+  {
+    notice = "I2C pins must be distinct and cannot be shared with an enabled analog or pulse input.";
+    noticeClass = "danger";
+    return false;
+  }
+  if ((tube1PinValue.length() > 0) && !isValidWroverInputPin(tube1PinValue.toInt()))
+  {
+    notice = "Tube 1 pulse pin is outside the ESP32 Wrover-E supported GPIO list.";
+    noticeClass = "danger";
+    return false;
+  }
+  if ((tube2PinValue.length() > 0) && !isValidWroverInputPin(tube2PinValue.toInt()))
+  {
+    notice = "Tube 2 pulse pin is outside the ESP32 Wrover-E supported GPIO list.";
+    noticeClass = "danger";
+    return false;
+  }
 
   if (tubePresetId == CUSTOM_TUBE_PRESET_ID)
   {
@@ -1293,6 +1691,21 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     if (!parsePositiveFloatField(tubeConversionFactorValue, customConversionFactor))
     {
       notice = "Custom tube conversion factor must be a positive number in uSv/h per CPM.";
+      noticeClass = "danger";
+      return false;
+    }
+  }
+  if (tube2PresetId == CUSTOM_TUBE_PRESET_ID)
+  {
+    if (!parsePositiveFloatField(tube2DeadTimeUs, customTube2DeadTimeUs))
+    {
+      notice = "Custom tube 2 dead time must be a positive number in microseconds.";
+      noticeClass = "danger";
+      return false;
+    }
+    if (!parsePositiveFloatField(tube2ConversionFactorValue, customTube2ConversionFactor))
+    {
+      notice = "Custom tube 2 conversion factor must be a positive number in uSv/h per CPM.";
       noticeClass = "danger";
       return false;
     }
@@ -1337,6 +1750,7 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   settingsStore.putBool("ser_verbose", serialVerbose);
   settingsStore.putBool("rad_en", radmonUploadEnabled);
   settingsStore.putBool("urad_en", uradmonUploadEnabled);
+  settingsStore.putBool("dual_tube", dualTubeEnabled);
   if (timezoneOffsetValue.length() > 0)
   {
     settingsStore.putInt("tz_offset", (int)parsedTimezoneOffset);
@@ -1388,6 +1802,30 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     settingsStore.remove("cpm_gauge");
   }
   saveRuntimeSetting(settingsStore, "station_name", stationNameValue);
+  if (hchoPinValue.length() > 0) settingsStore.putInt("hcho_adc_pin", hchoPinValue.toInt()); else settingsStore.remove("hcho_adc_pin");
+  if (hvPinValue.length() > 0) settingsStore.putInt("hv_adc_pin", hvPinValue.toInt()); else settingsStore.remove("hv_adc_pin");
+  if (i2cSdaPinValue.length() > 0) settingsStore.putInt("i2c_sda", i2cSdaPinValue.toInt()); else settingsStore.remove("i2c_sda");
+  if (i2cSclPinValue.length() > 0) settingsStore.putInt("i2c_scl", i2cSclPinValue.toInt()); else settingsStore.remove("i2c_scl");
+  if (tube1PinValue.length() > 0) settingsStore.putInt("tube1_pin", tube1PinValue.toInt()); else settingsStore.remove("tube1_pin");
+  if (tube2PinValue.length() > 0) settingsStore.putInt("tube2_pin", tube2PinValue.toInt()); else settingsStore.remove("tube2_pin");
+  settingsStore.putInt("exp_mask", (int)normalizeExpSensorMask(requestedExpSensorMask));
+  for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  {
+    String keyPrefix = String("ex_") + EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].key;
+    const ExpExtraSensorConfig &sensorConfig = requestedExtraSensorConfigs[sensorIndex];
+    if (sensorConfig.configured)
+    {
+      settingsStore.putInt((keyPrefix + "_pin").c_str(), sensorConfig.pin);
+      settingsStore.putFloat((keyPrefix + "_scale").c_str(), sensorConfig.scale);
+      settingsStore.putFloat((keyPrefix + "_offset").c_str(), sensorConfig.offset);
+    }
+    else
+    {
+      settingsStore.remove((keyPrefix + "_pin").c_str());
+      settingsStore.remove((keyPrefix + "_scale").c_str());
+      settingsStore.remove((keyPrefix + "_offset").c_str());
+    }
+  }
   settingsStore.putString("tube_preset", tubePresetId);
   if (tubePresetId == CUSTOM_TUBE_PRESET_ID)
   {
@@ -1399,12 +1837,23 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     settingsStore.remove("tube_dead");
     settingsStore.remove("tube_conv");
   }
+  settingsStore.putString("tube2_preset", tube2PresetId);
+  if (tube2PresetId == CUSTOM_TUBE_PRESET_ID)
+  {
+    settingsStore.putFloat("tube2_dead", customTube2DeadTimeUs / 1000000.0f);
+    settingsStore.putFloat("tube2_conv", customTube2ConversionFactor);
+  }
+  else
+  {
+    settingsStore.remove("tube2_dead");
+    settingsStore.remove("tube2_conv");
+  }
   settingsStore.end();
 
   loadRuntimeSettings();
   configureTimeRules();
   ntp.begin(activeNtpServer.c_str());
-  notice = "Settings saved to NVS. Calibration, history, and timezone settings apply immediately. Secret fields stay unchanged when left blank, or revert to defaults when their reset box is checked. Tube presets come from logger_user_config.h; choose Custom if you want to override them from the web UI. Reboot the device if you changed WiFi or hostname values.";
+  notice = "Settings saved to NVS. Calibration, history, timezone, and tube profile values apply immediately. Reboot after changing WiFi, hostname, I2C pins, or optional sensor pin/profile selections. Secret fields stay unchanged when left blank, or revert to defaults when their reset box is checked.";
   noticeClass = "success";
   return true;
 }
@@ -1451,6 +1900,215 @@ static String normalizeTubePresetId(const String &presetId)
   }
 
   return String(LOGGER_DEFAULT_TUBE_PRESET_ID);
+}
+
+static uint32_t normalizeExpSensorMask(const uint32_t &sensorMask)
+{
+  uint32_t normalized = sensorMask & 0x3FFFFFFUL;
+  if (normalized == 0)
+  {
+    return DEFAULT_EXP_SENSOR_MASK;
+  }
+  return normalized | EXP_SENSOR_TIME;
+}
+
+static bool isExpSensorEnabled(const uint32_t sensorMask, const uint32_t sensorFlag)
+{
+  if (sensorFlag == EXP_SENSOR_TIME)
+  {
+    return true;
+  }
+  return (sensorMask & sensorFlag) != 0;
+}
+
+static String buildExpToggleHtml(const char *fieldId, const char *label, const bool enabled, const char *pinSetupKey, const String &pinSummary)
+{
+  String html = "<div class='exp-sensor-control'><div class='form-check form-switch mb-0'><input class='form-check-input' type='checkbox' id='";
+  html += fieldId;
+  html += "' name='";
+  html += fieldId;
+  html += "'";
+  if (enabled) html += " checked";
+  html += "><label class='form-check-label' for='";
+  html += fieldId;
+  html += "'>";
+  html += htmlEscape(String(label));
+  html += "</label></div>";
+  if (pinSetupKey != NULL)
+  {
+    html += "<div class='exp-sensor-actions'><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='";
+    html += pinSetupKey;
+    html += "'>Configure</button><span class='form-text exp-sensor-summary' data-pin-summary='";
+    html += pinSetupKey;
+    html += "'>";
+    html += htmlEscape(pinSummary);
+    html += "</span></div>";
+  }
+  html += "</div>";
+  return html;
+}
+
+static String buildEsp32PinOptionsHtml(const String &selectedPinValue, const int *allowedPins, const size_t allowedPinCount, const bool analogOnly)
+{
+  String html;
+  html.reserve(512);
+  int selectedPin = selectedPinValue.toInt();
+
+  for (size_t index = 0; index < allowedPinCount; ++index)
+  {
+    int pinNumber = allowedPins[index];
+    html += "<option value='" + String(pinNumber) + "'" + String((selectedPin == pinNumber) ? " selected" : "") + ">GPIO" + String(pinNumber);
+    if (analogOnly)
+    {
+      if (pinNumber == 32) html += " (ADC1_CH4)";
+      else if (pinNumber == 33) html += " (ADC1_CH5)";
+      else if (pinNumber == 34) html += " (ADC1_CH6)";
+      else if (pinNumber == 35) html += " (ADC1_CH7)";
+      else if (pinNumber == 36) html += " (ADC1_CH0)";
+      else if (pinNumber == 39) html += " (ADC1_CH3)";
+    }
+    html += "</option>";
+  }
+
+  return html;
+}
+
+static bool isValidWroverAnalogInputPin(const int pinNumber)
+{
+  switch (pinNumber)
+  {
+    case 32:
+    case 33:
+    case 34:
+    case 35:
+    case 36:
+    case 39:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool isValidWroverInputPin(const int pinNumber)
+{
+  switch (pinNumber)
+  {
+    case 4:
+    case 5:
+    case 12:
+    case 13:
+    case 14:
+    case 15:
+    case 16:
+    case 17:
+    case 18:
+    case 19:
+    case 21:
+    case 22:
+    case 23:
+    case 25:
+    case 26:
+    case 27:
+    case 32:
+    case 33:
+    case 34:
+    case 35:
+    case 36:
+    case 39:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static void initializeConfiguredExpInputs(void)
+{
+  for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  {
+    const ExpExtraSensorConfig &sensorConfig = extraExpSensorConfigs[sensorIndex];
+    if (!sensorConfig.configured || !isExpSensorEnabled(activeExpSensorMask, EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].sensorFlag))
+    {
+      continue;
+    }
+
+    if (EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].inputMode == ExpExtraInputMode::AnalogLinear)
+    {
+      pinMode(sensorConfig.pin, INPUT);
+      analogSetPinAttenuation(sensorConfig.pin, ADC_11db);
+    }
+    else
+    {
+      pinMode(sensorConfig.pin, INPUT_PULLUP);
+      attachInterruptArg(sensorConfig.pin, handleExtraExpPulse, reinterpret_cast<void *>(sensorIndex + 1U), FALLING);
+    }
+  }
+
+  lastExtraExpSampleMillis = millis();
+}
+
+static void IRAM_ATTR handleExtraExpPulse(void *argument)
+{
+  size_t sensorIndex = reinterpret_cast<uintptr_t>(argument) - 1U;
+  if (sensorIndex >= EXTRA_EXP_SENSOR_COUNT)
+  {
+    return;
+  }
+
+  portENTER_CRITICAL_ISR(&extraExpPulseMux);
+  ++extraExpPulseCounts[sensorIndex];
+  portEXIT_CRITICAL_ISR(&extraExpPulseMux);
+}
+
+static float readConfiguredExpSensorValue(const size_t sensorIndex, const float elapsedSeconds)
+{
+  if ((sensorIndex >= EXTRA_EXP_SENSOR_COUNT) || !extraExpSensorConfigs[sensorIndex].configured)
+  {
+    return 0.0f;
+  }
+
+  const ExpExtraSensorConfig &sensorConfig = extraExpSensorConfigs[sensorIndex];
+  const ExpExtraSensorDefinition &sensorDefinition = EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex];
+  if (sensorDefinition.inputMode == ExpExtraInputMode::AnalogLinear)
+  {
+    uint32_t milliVoltTotal = 0;
+    for (uint8_t sampleIndex = 0; sampleIndex < 8; ++sampleIndex)
+    {
+      milliVoltTotal += analogReadMilliVolts(sensorConfig.pin);
+    }
+    float voltage = milliVoltTotal / 8000.0f;
+    float value = voltage * sensorConfig.scale + sensorConfig.offset;
+    if (sensorDefinition.sensorFlag == EXP_SENSOR_WIND_DIRECTION)
+    {
+      value = fmodf(value, 360.0f);
+      if (value < 0.0f) value += 360.0f;
+    }
+    return value;
+  }
+
+  uint32_t pulseCount = 0;
+  portENTER_CRITICAL(&extraExpPulseMux);
+  pulseCount = extraExpPulseCounts[sensorIndex];
+  extraExpPulseCounts[sensorIndex] = 0;
+  portEXIT_CRITICAL(&extraExpPulseMux);
+
+  if (sensorDefinition.inputMode == ExpExtraInputMode::PulseTotal)
+  {
+    return pulseCount * sensorConfig.scale + sensorConfig.offset;
+  }
+  float safeElapsedSeconds = (elapsedSeconds > 0.0f) ? elapsedSeconds : 1.0f;
+  return (pulseCount / safeElapsedSeconds) * sensorConfig.scale + sensorConfig.offset;
+}
+
+static uint8_t getUradTubeTypeId(const String &presetId)
+{
+  String normalizedPresetId = normalizeTubePresetId(presetId);
+  if (normalizedPresetId.equalsIgnoreCase(CUSTOM_TUBE_PRESET_ID))
+  {
+    return 0x00;
+  }
+
+  const TubePresetDefinition *preset = findTubePresetById(normalizedPresetId);
+  return (preset != NULL) ? preset->uradmonitorTubeTypeId : 0x00;
 }
 
 static String normalizeDstProfileId(const String &profileId)
@@ -1506,6 +2164,13 @@ static String formatOperatingVoltageRange(float minimumVoltage, float maximumVol
   return String(minimumVoltage, 0) + "-" + String(maximumVoltage, 0) + " V";
 }
 
+static String formatExpTubeTypeCode(const uint8_t tubeTypeId)
+{
+  char buffer[5];
+  snprintf(buffer, sizeof(buffer), "0x%02X", tubeTypeId);
+  return String(buffer);
+}
+
 static String buildTubePresetOptionsHtml(const String &selectedPresetId)
 {
   String html;
@@ -1514,7 +2179,7 @@ static String buildTubePresetOptionsHtml(const String &selectedPresetId)
   for (size_t index = 0; index < TUBE_PRESET_DEFINITIONS_COUNT; ++index)
   {
     const TubePresetDefinition &preset = TUBE_PRESET_DEFINITIONS[index];
-    html += "<option value='" + htmlEscape(String(preset.id)) + "' data-dead-us='" + String(preset.deadTimeSeconds * 1000000.0f, 3) + "' data-conv='" + String(preset.conversionFactorUsvPerCpm, 6) + "' data-vmin='" + String(preset.operatingVoltageMin, 0) + "' data-vmax='" + String(preset.operatingVoltageMax, 0) + "' data-note='" + htmlEscape(String(preset.note)) + "'";
+    html += "<option value='" + htmlEscape(String(preset.id)) + "' data-exp-id='" + formatExpTubeTypeCode(preset.uradmonitorTubeTypeId) + "' data-dead-us='" + String(preset.deadTimeSeconds * 1000000.0f, 3) + "' data-conv='" + String(preset.conversionFactorUsvPerCpm, 6) + "' data-vmin='" + String(preset.operatingVoltageMin, 0) + "' data-vmax='" + String(preset.operatingVoltageMax, 0) + "' data-note='" + htmlEscape(String(preset.note)) + "'";
     if (selectedPresetId.equalsIgnoreCase(preset.id))
     {
       html += " selected";
@@ -1522,7 +2187,7 @@ static String buildTubePresetOptionsHtml(const String &selectedPresetId)
     html += ">" + htmlEscape(String(preset.label)) + " (" + htmlEscape(formatOperatingVoltageRange(preset.operatingVoltageMin, preset.operatingVoltageMax)) + ")</option>";
   }
 
-  html += "<option value='" + String(CUSTOM_TUBE_PRESET_ID) + "' data-dead-us='' data-conv='' data-vmin='' data-vmax='' data-note='Use your tube datasheet and HV board documentation for the custom operating range.'";
+  html += "<option value='" + String(CUSTOM_TUBE_PRESET_ID) + "' data-exp-id='0x00' data-dead-us='' data-conv='' data-vmin='' data-vmax='' data-note='Use your tube datasheet and HV board documentation for the custom operating range.'";
   if (selectedPresetId.equalsIgnoreCase(CUSTOM_TUBE_PRESET_ID))
   {
     html += " selected";
@@ -1617,7 +2282,7 @@ static String adminPageShell(const String &title, const String &subtitle, const 
            ":root{--bg:#10161d;--bg-soft:#17212b;--card:#1c2733;--border:#334456;--text:#f3f7fb;--muted:#c5d1dd;--accent:#58a6ff;--accent-strong:#3d8bfd;--chip:#1a2834;--shadow:rgba(0,0,0,.28);--heroA:#17324a;--heroB:#245e86;--surface:rgba(255,255,255,.08);color-scheme:dark;}"
            "body[data-theme='light']{--bg:#eff4f8;--bg-soft:#f7fafc;--card:#ffffff;--border:#d4dee8;--text:#17212b;--muted:#5d6d7d;--accent:#1e6bd6;--accent-strong:#1451a8;--chip:#eef3f7;--shadow:rgba(22,41,66,.12);--heroA:#ddebf7;--heroB:#f7fbff;--surface:rgba(255,255,255,.72);color-scheme:light;}"
            "*{box-sizing:border-box;}body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:radial-gradient(circle at top,var(--heroA),var(--bg) 38%);color:var(--text);transition:background-color .25s,color .25s;}"
-           ".page-shell{max-width:1240px;margin:0 auto;padding:20px 16px 28px;}"
+           ".page-shell{max-width:1480px;margin:0 auto;padding:20px 20px 28px;}"
            ".topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:12px 14px;border:1px solid var(--border);border-radius:18px;background:var(--surface);backdrop-filter:blur(12px);box-shadow:0 12px 28px var(--shadow);}"
            ".brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.02em;color:var(--text);}"
            ".brand-mark{width:34px;height:34px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;font-size:1rem;box-shadow:0 8px 18px rgba(33,109,214,.28);}"
@@ -1640,6 +2305,13 @@ static String adminPageShell(const String &title, const String &subtitle, const 
            ".metric{font-size:1.9rem;font-weight:800;letter-spacing:-.03em;}"
            ".mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}"
            ".form-control,.form-select{background:var(--bg-soft)!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:14px!important;}"
+           ".form-control[readonly]{background:var(--bg)!important;color:var(--muted)!important;border-style:dashed!important;cursor:not-allowed;}"
+           ".exp-sensor-control{display:grid;grid-template-columns:minmax(0,1fr);gap:5px;padding:8px;border:1px solid var(--border);border-radius:8px;min-width:0;min-height:78px;background:var(--bg-soft);}"
+           ".exp-sensor-control .form-check{min-width:0;} .exp-sensor-control .form-check-label{overflow-wrap:anywhere;}"
+           ".exp-sensor-actions{display:flex;flex-wrap:wrap;align-items:center;gap:4px;min-width:0;} .exp-sensor-actions .btn{padding:3px 7px;font-size:.75rem;line-height:1.25;}"
+           ".exp-sensor-summary{min-width:0;overflow-wrap:anywhere;font-size:.7rem;margin:0!important;}"
+           ".i2c-device-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:6px;}"
+           ".i2c-device{display:flex;justify-content:space-between;gap:12px;padding:7px 9px;border:1px solid var(--border);border-radius:8px;background:var(--card);font-size:.82rem;}"
            ".form-control::placeholder{color:var(--muted)!important;}"
            ".btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent-strong))!important;border:none!important;}"
            ".btn-warning{color:#17212b!important;}"
@@ -1671,6 +2343,7 @@ static String adminPageShell(const String &title, const String &subtitle, const 
   }
   shell += "<div class='theme-picker'><label for='themeSelect'>Theme</label><select id='themeSelect'><option value='dark'>Dark</option><option value='light'>Light</option></select></div></nav></header>";
   shell += "<section class='hero'><div class='hero-grid'><div><h1>" + htmlEscape(title) + "</h1><p>" + htmlEscape(subtitle) + "</p><div class='hero-meta'><span class='hero-chip'>Device IP <span class='mono'>" + htmlEscape(ipText) + "</span></span><span class='hero-chip'>Hostname <span class='mono'>" + htmlEscape(my_hostname) + "</span></span><span class='hero-chip'><span id='adminUptimeValue' class='mono'>uptime " + htmlEscape(uptimeText) + "</span></span></div></div></div></section>";
+  shell += "<script>if(!String.prototype.replaceAll){String.prototype.replaceAll=function(search,replacement){return this.split(search).join(replacement);};}</script>";
   shell += body;
   shell += "<footer style='text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted);border-top:1px solid var(--border);margin-top:28px;'>&copy; 2022&ndash;" + String(ntp.formattedTime("%Y")) + " &middot; By <a href='https://www.don-zalmrol.be/' target='_blank' rel='noopener'>Don Zalmrol</a> &middot; <a href='https://github.com/DonZalmrol' target='_blank' rel='noopener'>GitHub</a> &middot; <a href='#' onclick='document.getElementById(\"changelogDlg\").showModal();return false;' style='color:var(--muted);text-decoration:none;font-family:monospace;'>" + String(FIRMWARE_VERSION) + "</a></footer>";
   shell += changelogDialogHtml();
@@ -1687,14 +2360,25 @@ float outputSieverts(float cpmValue)
   return uSV;
 }
 
+static float currentOutputSieverts(void)
+{
+  float tube1Dose = cpm1 * activeTubeConversionFactor;
+  if (!activeDualTubeEnabled)
+  {
+    return tube1Dose;
+  }
+  float tube2Dose = cpm2 * activeTube2ConversionFactor;
+  return (tube1Dose + tube2Dose) / 2.0f;
+}
+
 // Measure Tube voltage through A0
 float displayTubeVoltage(void)
 {
   float adcInput = 0.0, lowVoltage = 0.0, voltage_offset = 0.0, highVoltage = 0.0;
-  adcInput = (float)analogRead(33);
+  adcInput = (float)analogRead(activeHvAdcPin);
 
-  // ESP32 pin 33 measures from 0-3.3V and has a width of 0-4095
-  // Use 3.4 and 4096 as correcting values
+  // The configured Wrover-E ADC input measures from 0-3.3V and spans 0-4095 counts.
+  // Use 3.4 and 4096 as correcting values for the divider and ADC target range.
   lowVoltage = ((adcInput * 3.4 ) / 4096.0);
   
   /*
@@ -1731,8 +2415,8 @@ float calculateHCHO(void)
   // Source https://wiki.seeedstudio.com/Grove-HCHO_Sensor/
   float Rs = 0.0, ppm = 0.0;
 
-  // Read the input on analog pin34 (GPIO34)
-  int sensorValue = analogRead(34);
+  // Read the configured HCHO analog input pin.
+  int sensorValue = analogRead(activeHchoAdcPin);
   if (sensorValue == 0) return 0.0;
   Rs = (4095.0 / sensorValue) - 1;
 
@@ -1857,6 +2541,7 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
 {
   UploadRecord currentUpload = {};
   copyUploadRecord(currentUpload, snap);
+  currentUpload.cpm = snap->cpm1;
   float estimatedDrivePct = estimateHvDriveUploadPct(snap->tubeVoltage);
 
   if (!activeURadmonUploadEnabled)
@@ -1889,66 +2574,131 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
   * https://github.com/radhoo/uradmonitor_kit1/blob/master/code/misc/expProtocol.h
   */
   String ptr = "/api/v1/upload/exp";
-    ptr += "/01/";                // 01 = mandatory: local time in seconds
-    ptr += snap->epoch;           // time epoch (unix) value
+  ptr += "/01/";                // 01 = mandatory: local time in seconds
+  ptr += snap->epoch;           // time epoch (unix) value
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TEMPERATURE))
+  {
     ptr += "/02/";                // 02 = optional: temperature in degrees celsius
     ptr += snap->var_temperature; // temperature value
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PRESSURE))
+  {
     ptr += "/03/";                // 03 = optional: barometric pressure in pascals
     ptr += snap->var_pressure;    // pressure value
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HUMIDITY))
+  {
     ptr += "/04/";                // 04 = optional: humidity as relative humidity in percentage %
     ptr += snap->var_humidity;    // humidity value
+  }
 
-    ptr += "/05/";                // 05 = optional: luminosity as relative luminosity in percentage ‰
-    ptr += snap->luminosity;      // luminosity value
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_ILLUMINANCE))
+  {
+    ptr += "/05/";                // 05 = optional: illuminance in lux (TSL2561 visible lux reading)
+    ptr += snap->luminosity;      // lux value from the TSL2561 sensor
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_VOC))
+  {
     ptr += "/06/";                // 06 = optional: VOC (volatile organic compounds) in ohms
     ptr += snap->var_voc;         // VOC value
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CO2))
+  {
     ptr += "/07/";                // 07 = optional: CO2 (carbon dioxide) in ppm
     ptr += snap->var_co2;         // CO2 value
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CH2O))
+  {
     ptr += "/08/";                // 08 = optional: formaldehyde in ppm
     ptr += snap->var_hcho;        // HCHO value
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM25))
+  {
     ptr += "/09/";                // 09 = optional: particulate matter in micro grams per cubic meter
     ptr += snap->var_pm25;        // PM2.5 value
+  }
 
-    //ptr += "/0A/";              // 0A = optional: device battery voltage in volts
-    //ptr += batteryVoltage;      // battery voltage value
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_BATTERY))
+  {
+    ptr += "/0A/";
+    ptr += String(snap->extraExpValues[0], 3);
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CPM))
+  {
     ptr += "/0B/";                // 0B = optional: radiation measured on geiger tube in cpm
-    ptr += snap->cpm;             // cpm value
+    ptr += snap->cpm1;            // tube 1 CPM value
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV))
+  {
     ptr += "/0C/";                // 0C = optional: high voltage geiger tube inverter voltage in volts
     ptr += snap->tubeVoltage;     // tube voltage value
-    
+  }
+
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV_DUTY))
+  {
     ptr += "/0D/";                // 0D = estimated HV drive index in %, derived from measured tube voltage
     ptr += estimatedDrivePct;
+  }
 
-    ptr += "/0E/";                // 0E = optional: hardware version
-    ptr += "107";                 // hardware value = original 106 | new 107 in 2024
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HARDWARE_VERSION))
+  {
+    ptr += "/0E/";
+    ptr += "107";
+  }
 
-    ptr += "/0F/";                // 0F = optional: software firmware version
-    ptr += "124";                 // software value = original 124 | new 124 in 2024
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_FIRMWARE_VERSION))
+  {
+    ptr += "/0F/";
+    ptr += "124";
+  }
 
-    ptr += "/10/";                // 10 = optional: Tube ID
-    ptr += "0x3";                 // 0x3 = GEIGER_TUBE_SBM19  | 0x6 = GEIGER_TUBE_SI22G
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TUBE_TYPE))
+  {
+    ptr += "/10/";                // 10 = optional: tube type ID (uRADMonitor EXP detector enum)
+    ptr += String(getUradTubeTypeId(activeTubePresetId));
+  }
 
-    //ptr += "/11/";                // 11 = optional: noise in dB
-    //ptr += noiseDb;               // noiseDb = sound value
-
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM1))
+  {
     ptr += "/12/";                // 12 = optional: particulate matter in micro grams per cubic meter
-    ptr += snap->var_pm01;         // var_pm01 value
+    ptr += snap->var_pm01;        // var_pm01 value
+  }
 
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM10))
+  {
     ptr += "/13/";                // 13 = optional: particulate matter in micro grams per cubic meter
-    ptr += snap->var_pm10;         // var_pm10 value
+    ptr += snap->var_pm10;        // var_pm10 value
+  }
 
-    //ptr += "/14/";                // 14 = optional: ozone in ppb
-    //ptr += ozoneValue;            // ozoneValue = ozone value
-  
+  for (size_t sensorIndex = 1; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  {
+    if (!isExpSensorEnabled(activeExpSensorMask, EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].sensorFlag))
+    {
+      continue;
+    }
+    char fieldCode[3];
+    snprintf(fieldCode, sizeof(fieldCode), "%02X", EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex].expFieldId);
+    ptr += "/";
+    ptr += fieldCode;
+    ptr += "/";
+    ptr += String(snap->extraExpValues[sensorIndex], 3);
+  }
+
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_WIFI_SIGNAL) && (WiFi.status() == WL_CONNECTED))
+  {
+    ptr += "/1A/";
+    ptr += WiFi.RSSI();
+  }
+
   // Test output
   VERBOSE_SERIAL_PRINTLN("created EXP code = " + ptr);
 
@@ -1990,6 +2740,7 @@ static void scanI2C(void)
   Serial.println("Scanning for I2C devices...");
   
   nDevices = 0;
+  memset(i2cDeviceAddresses, 0, sizeof(i2cDeviceAddresses));
   
   for(address = 1; address < 127; address++ )
   {
@@ -2006,6 +2757,10 @@ static void scanI2C(void)
       }
       
       Serial.println(address,HEX);
+      if (nDevices < (int)(sizeof(i2cDeviceAddresses) / sizeof(i2cDeviceAddresses[0])))
+      {
+        i2cDeviceAddresses[nDevices] = address;
+      }
       nDevices++;
     }
     else if (error==4)
@@ -2034,6 +2789,32 @@ static void scanI2C(void)
   esp_task_wdt_reset();
   delay(5000);          
   esp_task_wdt_reset();
+}
+
+static String buildI2cDiscoveryHtml(void)
+{
+  String html = "<div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold'>I2C auto-discovery</div>";
+  html += "<div class='form-text'>Scanned automatically at startup on SDA GPIO" + String(activeI2cSdaPin) + " / SCL GPIO" + String(activeI2cSclPin) + ". Reboot after changing bus pins to scan the new bus.</div>";
+  if (i2cDevicesFound <= 0)
+  {
+    html += "<div class='alert alert-warning mt-3 mb-0'>No I2C devices were detected on the last boot scan. Check power, wiring, pull-ups, and the SDA/SCL selections.</div></div>";
+    return html;
+  }
+
+  html += "<div class='form-text mt-2'>Detected " + String(i2cDevicesFound) + " device" + String(i2cDevicesFound == 1 ? "" : "s") + ":</div><div class='i2c-device-list mt-2'>";
+  for (int index = 0; index < i2cDevicesFound && index < (int)(sizeof(i2cDeviceAddresses) / sizeof(i2cDeviceAddresses[0])); ++index)
+  {
+    uint8_t address = i2cDeviceAddresses[index];
+    char addressText[8];
+    snprintf(addressText, sizeof(addressText), "0x%02X", address);
+    const char *deviceName = "Unidentified I2C device";
+    if ((address == 0x76) || (address == 0x77)) deviceName = "BME680";
+    else if (address == 0x40) deviceName = "HM3301";
+    else if ((address == 0x29) || (address == 0x39) || (address == 0x49)) deviceName = "TSL2561";
+    html += "<div class='i2c-device'><span class='mono'>" + String(addressText) + "</span><span>" + String(deviceName) + "</span></div>";
+  }
+  html += "</div></div>";
+  return html;
 }
 
 // Load latest data from EEPROM
@@ -2079,14 +2860,12 @@ static void updateStateFunction(void * parameter)
   
   /* 
     Set a trigger to save the state. Here, the state is saved every STATE_SAVE_PERIOD with the first state being saved once the algorithm achieves full calibration, i.e. iaqAccuracy = 3 
-    0 = Stabilizing
     1 = Uncertain
     2 = Calibrating
     3 = Calibrated
   */
   if (lastStateSaveMillis == 0)
   {
-    if (ss->iaqAccuracy >= 3)
     {
       updateEEPROM = true;
     }
@@ -2125,7 +2904,6 @@ static void updateStateFunction(void * parameter)
   //{
     //Serial.println(F("Not saved state to EEPROM"));
   //}
-
   delete ss;
   
   esp_task_wdt_delete(NULL);
@@ -2147,9 +2925,9 @@ static bool Init_PulseCounter_01(void)
     return false;
   }
 
-  // Configure the IO pin: GPIO13 as edge signal input
+  // Configure the IO pin for tube 1 as edge signal input
   pcnt_chan_config_t chan_config = {
-    .edge_gpio_num = PCNT_INPUT_SIG_IO_01,
+    .edge_gpio_num = activeTube1PulsePin,
     .level_gpio_num = -1,
   };
   if (!checkEspOk("pcnt_new_channel tube 1", pcnt_new_channel(pcnt_unit_01, &chan_config, &pcnt_chan_01)))
@@ -2207,6 +2985,12 @@ static bool Init_PulseCounter_01(void)
 
 static bool Init_PulseCounter_02(void)
 {
+  if (!activeDualTubeEnabled)
+  {
+    Serial.println(F("Tube 2 disabled in runtime config; skipping second pulse counter init."));
+    return true;
+  }
+
   // Configure pulse counter unit 1
   pcnt_unit_config_t unit_config = {
     .low_limit = -PCNT_H_LIM_VAL,
@@ -2217,9 +3001,9 @@ static bool Init_PulseCounter_02(void)
     return false;
   }
 
-  // Configure the IO pin: GPIO14 as edge signal input
+  // Configure the IO pin for tube 2 as edge signal input
   pcnt_chan_config_t chan_config = {
-    .edge_gpio_num = PCNT_INPUT_SIG_IO_02,
+    .edge_gpio_num = activeTube2PulsePin,
     .level_gpio_num = -1,
   };
   if (!checkEspOk("pcnt_new_channel tube 2", pcnt_new_channel(pcnt_unit_02, &chan_config, &pcnt_chan_02)))
@@ -2285,15 +3069,24 @@ static void Clean_Counters()
 
   // Stop pulse counters to clear them
   checkEspOk("pcnt_unit_stop tube 1", pcnt_unit_stop(pcnt_unit_01));
-  checkEspOk("pcnt_unit_stop tube 2", pcnt_unit_stop(pcnt_unit_02));
+  if (activeDualTubeEnabled && (pcnt_unit_02 != NULL))
+  {
+    checkEspOk("pcnt_unit_stop tube 2", pcnt_unit_stop(pcnt_unit_02));
+  }
 
   // Clear the count
   checkEspOk("pcnt_unit_clear_count tube 1", pcnt_unit_clear_count(pcnt_unit_01));
-  checkEspOk("pcnt_unit_clear_count tube 2", pcnt_unit_clear_count(pcnt_unit_02));
+  if (activeDualTubeEnabled && (pcnt_unit_02 != NULL))
+  {
+    checkEspOk("pcnt_unit_clear_count tube 2", pcnt_unit_clear_count(pcnt_unit_02));
+  }
 
   // Restart pulse counters
   checkEspOk("pcnt_unit_start tube 1", pcnt_unit_start(pcnt_unit_01));
-  checkEspOk("pcnt_unit_start tube 2", pcnt_unit_start(pcnt_unit_02));
+  if (activeDualTubeEnabled && (pcnt_unit_02 != NULL))
+  {
+    checkEspOk("pcnt_unit_start tube 2", pcnt_unit_start(pcnt_unit_02));
+  }
 }
 
 void handleRootPath()
@@ -2325,10 +3118,15 @@ void handleConfigPath()
   bool uradmonUploadEnabledChecked = activeURadmonUploadEnabled;
   String displayedWifiSsid = my_ssid;
   String displayedTubePresetId = activeTubePresetId;
+  String displayedTube2PresetId = activeTube2PresetId;
   String displayedTubeDeadTimeUs = String(activeTubeDeadTimeSeconds * 1000000.0f, 3);
   String displayedTubeConversionFactor = String(activeTubeConversionFactor, 6);
+  String displayedTube2DeadTimeUs = String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
+  String displayedTube2ConversionFactor = String(activeTube2ConversionFactor, 6);
   String displayedTubeVoltageRange = formatOperatingVoltageRange(activeTubeOperatingVoltageMin, activeTubeOperatingVoltageMax);
+  String displayedTube2VoltageRange = formatOperatingVoltageRange(activeTube2OperatingVoltageMin, activeTube2OperatingVoltageMax);
   String displayedTubeNote = activeTubePresetNote;
+  String displayedTube2Note = activeTube2PresetNote;
   String displayedTimezoneOffset = String(activeTimezoneOffsetMinutes);
   String displayedDstProfile = activeDstProfileId;
   String displayedDstOffset = String(activeDstOffsetMinutes);
@@ -2338,6 +3136,12 @@ void handleConfigPath()
   String displayedNtpServer = activeNtpServer;
   String displayedCpmGaugeFullScale = String(activeCpmGaugeFullScale);
   String displayedStationName = activeStationName;
+  String displayedI2cSdaPin = String(activeI2cSdaPin);
+  String displayedI2cSclPin = String(activeI2cSclPin);
+  String displayedHchoAdcPin = String(activeHchoAdcPin);
+  String displayedHvAdcPin = String(activeHvAdcPin);
+  String displayedTube1Pin = String(activeTube1PulsePin);
+  String displayedTube2Pin = String(activeTube2PulsePin);
 
   if ((server.method() == HTTP_GET) && server.hasArg("wifi_ssid_pick"))
   {
@@ -2352,8 +3156,11 @@ void handleConfigPath()
   if (server.method() == HTTP_POST)
   {
     displayedTubePresetId = normalizeTubePresetId(server.arg("tube_preset"));
+    displayedTube2PresetId = server.hasArg("tube2_preset") ? normalizeTubePresetId(server.arg("tube2_preset")) : activeTube2PresetId;
     displayedTubeDeadTimeUs = server.arg("tube_dead_time_us");
     displayedTubeConversionFactor = server.arg("tube_conversion_factor");
+    displayedTube2DeadTimeUs = server.hasArg("tube2_dead_time_us") ? server.arg("tube2_dead_time_us") : String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
+    displayedTube2ConversionFactor = server.hasArg("tube2_conversion_factor") ? server.arg("tube2_conversion_factor") : String(activeTube2ConversionFactor, 6);
     displayedTimezoneOffset = server.arg("timezone_offset_minutes");
     displayedDstProfile = normalizeDstProfileId(server.arg("dst_profile"));
     displayedDstOffset = server.arg("dst_offset_minutes");
@@ -2363,8 +3170,16 @@ void handleConfigPath()
     displayedNtpServer = server.arg("ntp_server");
     displayedCpmGaugeFullScale = server.arg("cpm_gauge_full_scale");
     displayedStationName = server.arg("station_name");
+    displayedI2cSdaPin = server.arg("i2c_sda_pin");
+    displayedI2cSclPin = server.arg("i2c_scl_pin");
+    displayedHchoAdcPin = server.arg("hcho_adc_pin");
+    displayedHvAdcPin = server.arg("hv_adc_pin");
+    displayedTube1Pin = server.arg("tube1_pin");
+    displayedTube2Pin = server.arg("tube2_pin");
     displayedTubeDeadTimeUs.trim();
     displayedTubeConversionFactor.trim();
+    displayedTube2DeadTimeUs.trim();
+    displayedTube2ConversionFactor.trim();
     displayedTimezoneOffset.trim();
     displayedDstOffset.trim();
     displayedHvCalibrationFactor.trim();
@@ -2373,6 +3188,12 @@ void handleConfigPath()
     displayedNtpServer.trim();
     displayedCpmGaugeFullScale.trim();
     displayedStationName.trim();
+    displayedI2cSdaPin.trim();
+    displayedI2cSclPin.trim();
+    displayedHchoAdcPin.trim();
+    displayedHvAdcPin.trim();
+    displayedTube1Pin.trim();
+    displayedTube2Pin.trim();
 
     if (displayedTubeDeadTimeUs.length() == 0)
     {
@@ -2381,6 +3202,14 @@ void handleConfigPath()
     if (displayedTubeConversionFactor.length() == 0)
     {
       displayedTubeConversionFactor = String(activeTubeConversionFactor, 6);
+    }
+    if (displayedTube2DeadTimeUs.length() == 0)
+    {
+      displayedTube2DeadTimeUs = String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
+    }
+    if (displayedTube2ConversionFactor.length() == 0)
+    {
+      displayedTube2ConversionFactor = String(activeTube2ConversionFactor, 6);
     }
 
     if (saveRuntimeSettingsFromRequest(notice, noticeClass))
@@ -2392,10 +3221,15 @@ void handleConfigPath()
       radmonUploadEnabledChecked = activeRadmonUploadEnabled;
       uradmonUploadEnabledChecked = activeURadmonUploadEnabled;
       displayedTubePresetId = activeTubePresetId;
+      displayedTube2PresetId = activeTube2PresetId;
       displayedTubeDeadTimeUs = String(activeTubeDeadTimeSeconds * 1000000.0f, 3);
       displayedTubeConversionFactor = String(activeTubeConversionFactor, 6);
+      displayedTube2DeadTimeUs = String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
+      displayedTube2ConversionFactor = String(activeTube2ConversionFactor, 6);
       displayedTubeVoltageRange = formatOperatingVoltageRange(activeTubeOperatingVoltageMin, activeTubeOperatingVoltageMax);
+      displayedTube2VoltageRange = formatOperatingVoltageRange(activeTube2OperatingVoltageMin, activeTube2OperatingVoltageMax);
       displayedTubeNote = activeTubePresetNote;
+      displayedTube2Note = activeTube2PresetNote;
       displayedTimezoneOffset = String(activeTimezoneOffsetMinutes);
       displayedDstProfile = activeDstProfileId;
       displayedDstOffset = String(activeDstOffsetMinutes);
@@ -2405,18 +3239,24 @@ void handleConfigPath()
       displayedNtpServer = activeNtpServer;
       displayedCpmGaugeFullScale = String(activeCpmGaugeFullScale);
       displayedStationName = activeStationName;
+      displayedI2cSdaPin = String(activeI2cSdaPin);
+      displayedI2cSclPin = String(activeI2cSclPin);
+      displayedHchoAdcPin = String(activeHchoAdcPin);
+      displayedHvAdcPin = String(activeHvAdcPin);
+      displayedTube1Pin = String(activeTube1PulsePin);
+      displayedTube2Pin = String(activeTube2PulsePin);
     }
   }
 
   String body;
-  body.reserve(8600);
+  body.reserve(18000);
   if (notice.length() > 0)
   {
     body += "<div class='alert alert-" + noticeClass + "' role='alert'>" + htmlEscape(notice) + "</div>";
   }
 
   body += "<div class='row g-4'>";
-  body += "<div class='col-12 col-xl-8'><div class='card'><div class='card-body'>";
+  body += "<div class='col-12 col-xl-9'><div class='card'><div class='card-body'>";
   body += "<h2 class='h5 mb-3'>Runtime Configuration</h2>";
   body += "<p class='hint mb-4'>Values saved here override the compiled defaults. Text fields fall back to <span class='mono'>arduino_secrets.h</span> when left blank, numeric fields fall back to their compiled firmware defaults when cleared, and secret fields stay unchanged unless you enter a replacement or tick their reset box.</p>";
   body += "<form method='post' action='/config' class='row g-3'>";
@@ -2453,27 +3293,107 @@ void handleConfigPath()
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Calibration and Logging</h3></div>";
   body += "<div class='col-md-4'><label class='form-label' for='hv_calibration_factor'>Tube HV Calibration</label><input class='form-control mono' id='hv_calibration_factor' name='hv_calibration_factor' value='" + htmlEscape(displayedHvCalibrationFactor) + "'><div class='form-text'>ADC-to-HV multiplier used by the tube voltage display.</div></div>";
   body += "<div class='col-md-4'><label class='form-label' for='hcho_r0'>HCHO R0</label><input class='form-control mono' id='hcho_r0' name='hcho_r0' value='" + htmlEscape(displayedHchoR0) + "'><div class='form-text'>Sensor calibration value used by the Grove HCHO conversion formula.</div></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='history_retention_hours'>Historic Storage (hours)</label><input class='form-control mono' id='history_retention_hours' name='history_retention_hours' value='" + htmlEscape(displayedHistoryRetentionHours) + "'><div class='form-text'>Approximate Graphs history retained on SPIFFS. Default is 1 hour.</div></div>";
+  body += "<div class='col-md-4'><label class='form-label' for='history_retention_hours'>Historic Storage (hours)</label><input class='form-control mono' id='history_retention_hours' name='history_retention_hours' value='" + htmlEscape(displayedHistoryRetentionHours) + "'><div class='form-text'>Approximate Graphs history retained on SPIFFS. Default is 1 hour.</div><div class='alert alert-warning mt-2 mb-0'>Increasing historic storage beyond 24 hours can fill the entire SPIFFS partition on this build.</div></div>";
   body += "<div class='col-md-4'><label class='form-label' for='cpm_gauge_full_scale'>CPM Gauge Full-Scale</label><input class='form-control mono' id='cpm_gauge_full_scale' name='cpm_gauge_full_scale' value='" + htmlEscape(displayedCpmGaugeFullScale) + "'><div class='form-text'>CPM at which the radiation gauge reads 100%. Match to your tube type. Default: 600 CPM.</div></div>";
-  body += "<div class='col-12'><div class='alert alert-warning mb-0'>Warning: increasing historic storage beyond 24 hours can fill the entire SPIFFS partition on this build.</div></div>";
-  body += "<div class='col-12'><div class='hint'>Clear a numeric field if you want the firmware to return to its compiled default for that item.</div></div>";
-
-  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Radiation Tube Setup</h3></div>";
-  body += "<div class='col-md-6'><label class='form-label' for='tube_preset'>Tube Type</label><select class='form-select' id='tube_preset' name='tube_preset'>" + buildTubePresetOptionsHtml(displayedTubePresetId) + "</select><div id='tubePresetHint' class='form-text'>Preset values are loaded from logger_user_config.h. Choose Custom to enter your own values below.</div></div>";
-  body += "<div class='col-md-3'><label class='form-label' for='tube_dead_time_us'>Dead Time (us)</label><input class='form-control mono' id='tube_dead_time_us' name='tube_dead_time_us' value='" + htmlEscape(displayedTubeDeadTimeUs) + "'><div class='form-text'>Used for pulse dead-time correction.</div></div>";
-  body += "<div class='col-md-3'><label class='form-label' for='tube_conversion_factor'>Conversion Factor</label><input class='form-control mono' id='tube_conversion_factor' name='tube_conversion_factor' value='" + htmlEscape(displayedTubeConversionFactor) + "'><div class='form-text'>Dose conversion in uSv/h per CPM.</div></div>";
-  body += "<div class='col-12'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-1'>Active tube profile</div><div class='hint'>Current runtime selection: <span class='mono' id='tubeProfileName'>" + htmlEscape(activeTubePresetLabel) + "</span><br>Operating range: <span class='mono' id='tubeVoltageRange'>" + htmlEscape(displayedTubeVoltageRange) + "</span><br><span id='tubeProfileNote'>" + htmlEscape(displayedTubeNote) + "</span><br>Preset values stay in the dedicated header, while Custom values are saved in NVS so end users can adjust them without rebuilding firmware.</div></div></div>";
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Radiation Tube Profiles</h3></div>";
+  body += "<div class='col-12'><h4 class='h6 mb-0'>Tube 1</h4></div>";
+  body += "<div class='col-md-6'><label class='form-label' for='tube_preset'>Tube 1 Type</label><select class='form-select' id='tube_preset' name='tube_preset'>" + buildTubePresetOptionsHtml(displayedTubePresetId) + "</select><div class='form-text'>EXP field 10 supports one tube ID and reports Tube 1. The selected type and calibration apply to Tube 1.</div></div>";
+  body += "<div class='col-12 col-lg-6'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-1'>Active tube profile</div><div class='hint'>Current runtime selection: <span class='mono' id='tubeProfileName'>" + htmlEscape(activeTubePresetLabel) + "</span><br>EXP tube code: <span class='mono' id='tubeExpCode'>" + formatExpTubeTypeCode(getUradTubeTypeId(displayedTubePresetId)) + "</span><br>Operating range: <span class='mono' id='tubeVoltageRange'>" + htmlEscape(displayedTubeVoltageRange) + "</span><br><span id='tubeProfileNote'>" + htmlEscape(displayedTubeNote) + "</span></div><div class='row g-3 mt-2'><div class='col-sm-6'><label class='form-label' for='tube_dead_time_us'>Dead Time (us)</label><input class='form-control mono' id='tube_dead_time_us' name='tube_dead_time_us' value='" + htmlEscape(displayedTubeDeadTimeUs) + "'" + String(displayedTubePresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + "><div class='form-text'>Dead-time correction for Tube 1.</div></div><div class='col-sm-6'><label class='form-label' for='tube_conversion_factor'>Conversion Factor</label><input class='form-control mono' id='tube_conversion_factor' name='tube_conversion_factor' value='" + htmlEscape(displayedTubeConversionFactor) + "'" + String(displayedTubePresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + "><div class='form-text'>Dose in uSv/h per CPM.</div></div></div><div class='form-text mt-2' id='tubeCalibrationHint'>Preset calibration is fixed. Choose Custom to edit.</div></div></div>";
+  body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='dual_tube_enabled' name='dual_tube_enabled'" + String(activeDualTubeEnabled ? " checked" : "") + "><label class='form-check-label' for='dual_tube_enabled'>Enable second GM tube</label><div class='form-text'>When off, Tube 2 profile controls, pulse counting, and dashboard readings are hidden.</div></div></div>";
+  body += "<div class='col-12' id='tube2ProfileSection'" + String(activeDualTubeEnabled ? "" : " style='display:none'") + "><div class='row g-3'><div class='col-12'><h4 class='h6 mb-0'>Tube 2</h4></div>";
+  body += "<div class='col-md-6'><label class='form-label' for='tube2_preset'>Tube 2 Type</label><select class='form-select' id='tube2_preset' name='tube2_preset'" + String(activeDualTubeEnabled ? "" : " disabled") + ">" + buildTubePresetOptionsHtml(displayedTube2PresetId) + "</select><div class='form-text'>Tube 2 uses its own dead time and dose conversion. EXP field 10 still reports Tube 1.</div></div>";
+  body += "<div class='col-12 col-lg-6'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-1'>Active Tube 2 profile</div><div class='hint'>Current runtime selection: <span class='mono' id='tube2ProfileName'>" + htmlEscape(activeTube2PresetLabel) + "</span><br>EXP tube code: <span class='mono' id='tube2ExpCode'>" + formatExpTubeTypeCode(getUradTubeTypeId(displayedTube2PresetId)) + "</span><br>Operating range: <span class='mono' id='tube2VoltageRange'>" + htmlEscape(displayedTube2VoltageRange) + "</span><br><span id='tube2ProfileNote'>" + htmlEscape(displayedTube2Note) + "</span><br>EXP field 10 reports Tube 1 only.</div><div class='row g-3 mt-2'><div class='col-sm-6'><label class='form-label' for='tube2_dead_time_us'>Dead Time (us)</label><input class='form-control mono' id='tube2_dead_time_us' name='tube2_dead_time_us' value='" + htmlEscape(displayedTube2DeadTimeUs) + "'" + String(displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + String(activeDualTubeEnabled ? "" : " disabled") + "><div class='form-text'>Dead-time correction for Tube 2.</div></div><div class='col-sm-6'><label class='form-label' for='tube2_conversion_factor'>Conversion Factor</label><input class='form-control mono' id='tube2_conversion_factor' name='tube2_conversion_factor' value='" + htmlEscape(displayedTube2ConversionFactor) + "'" + String(displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + String(activeDualTubeEnabled ? "" : " disabled") + "><div class='form-text'>Dose in uSv/h per CPM.</div></div></div><div class='form-text mt-2' id='tube2CalibrationHint'>Preset calibration is fixed. Choose Custom to edit.</div></div></div></div></div>";
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>ESP32 Wrover-E GPIO Mapping</h3></div>";
+  String sharedI2cSummary = "GPIO" + String(activeI2cSdaPin) + " / GPIO" + String(activeI2cSclPin);
+  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Shared I2C bus</div><div class='form-text'>BME680, HM3301, and TSL2561</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='i2c'>Configure <span class='mono' id='pinSummary_i2c' data-pin-summary='i2c'>" + htmlEscape(sharedI2cSummary) + "</span></button></div></div>";
+  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Tube high-voltage ADC</div><div class='form-text'>Used by Tube Voltage and HV Duty EXP fields</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='hv_adc_pin'>Configure <span class='mono' id='pinSummary_hv_adc_pin' data-pin-summary='hv_adc_pin'>GPIO" + String(activeHvAdcPin) + "</span></button></div></div>";
+  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>HCHO analog input</div><div class='form-text'>CH2O EXP field (08); calibration remains in HCHO R0</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='hcho_adc_pin'>Configure <span class='mono' id='pinSummary_hcho_adc_pin' data-pin-summary='hcho_adc_pin'>GPIO" + String(activeHchoAdcPin) + "</span></button></div></div>";
+  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Tube 1 pulse input</div><div class='form-text'>Used by Tube 1 CPM</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='tube1_pin'>Configure <span class='mono' id='pinSummary_tube1_pin' data-pin-summary='tube1_pin'>GPIO" + String(activeTube1PulsePin) + "</span></button></div></div>";
+  body += "<div class='col-md-6' id='tube2PinConfigRow'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Tube 2 pulse input</div><div class='form-text'>Tube 2 radiation counter input</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='tube2_pin'>Configure <span class='mono' id='pinSummary_tube2_pin' data-pin-summary='tube2_pin'>GPIO" + String(activeTube2PulsePin) + "</span></button></div></div>";
+  body += "<div style='display:none'>";
+  body += "<select id='i2c_sda_pin' name='i2c_sda_pin'>" + buildEsp32PinOptionsHtml(displayedI2cSdaPin, (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select>";
+  body += "<select id='i2c_scl_pin' name='i2c_scl_pin'>" + buildEsp32PinOptionsHtml(displayedI2cSclPin, (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select>";
+  body += "<select id='hv_adc_pin' name='hv_adc_pin'>" + buildEsp32PinOptionsHtml(displayedHvAdcPin, (const int[]){32, 33, 34, 35, 36, 39}, 6, true) + "</select>";
+  body += "<select id='hcho_adc_pin' name='hcho_adc_pin'>" + buildEsp32PinOptionsHtml(displayedHchoAdcPin, (const int[]){32, 33, 34, 35, 36, 39}, 6, true) + "</select>";
+  body += "<select id='tube1_pin' name='tube1_pin'>" + buildEsp32PinOptionsHtml(displayedTube1Pin, (const int[]){4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39}, 22, false) + "</select>";
+  body += "<select id='tube2_pin' name='tube2_pin'>" + buildEsp32PinOptionsHtml(displayedTube2Pin, (const int[]){4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39}, 22, false) + "</select></div>";
+  body += "<div class='col-12'>" + buildI2cDiscoveryHtml() + "</div>";
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>EXP Sensor Selection</h3></div>";
+  body += "<div class='col-12'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-2'>Enable EXP sensor fields</div><div class='row g-4'>";
+  body += "<div class='col-12'><div class='small text-uppercase text-body-secondary mb-2'>Environmental fields</div><div class='row row-cols-1 row-cols-md-2 g-2'>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_temperature", "Temperature (02)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TEMPERATURE), "i2c", sharedI2cSummary) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pressure", "Pressure (03)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PRESSURE), "i2c", sharedI2cSummary) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_humidity", "Humidity (04)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HUMIDITY), "i2c", sharedI2cSummary) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_illuminance", "Illuminance / lux (05)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_ILLUMINANCE), "i2c", sharedI2cSummary) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_voc", "VOC (06)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_VOC), "i2c", sharedI2cSummary) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_co2", "CO2 (07)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CO2), "i2c", sharedI2cSummary) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_ch2o", "CH2O / HCHO (08)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CH2O), "hcho_adc_pin", "GPIO" + String(activeHchoAdcPin)) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pm25", "PM2.5 (09)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM25), "i2c", sharedI2cSummary) + "</div>";
+  body += "</div></div>";
+  body += "<div class='col-12'><div class='small text-uppercase text-body-secondary mb-2'>Radiation and device fields</div><div class='row row-cols-1 row-cols-md-2 g-2'>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_cpm", "Tube 1 CPM (0B)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CPM), "tube1_pin", "GPIO" + String(activeTube1PulsePin)) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_hv", "Tube voltage (0C)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV), "hv_adc_pin", "GPIO" + String(activeHvAdcPin)) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_hv_duty", "HV duty cycle (0D)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV_DUTY), "hv_adc_pin", "GPIO" + String(activeHvAdcPin)) + "</div>";
+  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_tube_type' name='exp_sensor_tube_type'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TUBE_TYPE) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_tube_type'>Tube type ID (10)</label></div></div>";
+  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_hardware_version' name='exp_sensor_hardware_version'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HARDWARE_VERSION) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_hardware_version'>Hardware version (0E)</label></div></div>";
+  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_firmware_version' name='exp_sensor_firmware_version'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_FIRMWARE_VERSION) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_firmware_version'>Firmware version (0F)</label></div></div>";
+  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_wifi_signal' name='exp_sensor_wifi_signal'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_WIFI_SIGNAL) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_wifi_signal'>Wi-Fi signal (1A, dBm)</label></div></div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pm1", "PM1.0 (12)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM1), "i2c", sharedI2cSummary) + "</div>";
+  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pm10", "PM10 (13)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM10), "i2c", sharedI2cSummary) + "</div>";
+  for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  {
+    const ExpExtraSensorDefinition &sensorDefinition = EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex];
+    const ExpExtraSensorConfig &sensorConfig = extraExpSensorConfigs[sensorIndex];
+    String fieldPrefix = String("exp_") + sensorDefinition.key;
+    bool selected = sensorConfig.configured && isExpSensorEnabled(activeExpSensorMask, sensorDefinition.sensorFlag);
+    String configuredStatus = sensorConfig.configured
+      ? "GPIO" + String(sensorConfig.pin) + " | scale " + String(sensorConfig.scale, 4) + " | offset " + String(sensorConfig.offset, 4)
+      : "Pin and calibration not configured";
+    body += "<div class='col'><div class='d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2'>";
+    body += "<div><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='exp_sensor_" + String(sensorDefinition.key) + "' name='exp_sensor_" + String(sensorDefinition.key) + "'" + String(selected ? " checked" : "") + String(sensorConfig.configured ? "" : " disabled") + "><label class='form-check-label' for='exp_sensor_" + String(sensorDefinition.key) + "'>" + String(sensorDefinition.label) + "</label></div><div class='form-text' id='exp_" + String(sensorDefinition.key) + "_status'>" + configuredStatus + "</div></div>";
+    String inputMode = sensorDefinition.inputMode == ExpExtraInputMode::AnalogLinear ? "analog" : (sensorDefinition.inputMode == ExpExtraInputMode::PulseRate ? "pulse-rate" : "pulse-total");
+    body += "<button type='button' class='btn btn-sm btn-outline-secondary' data-exp-setup='" + String(sensorDefinition.key) + "' data-exp-label='" + String(sensorDefinition.label) + "' data-exp-mode='" + inputMode + "'>Configure</button>";
+    body += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_pin' name='exp_" + String(sensorDefinition.key) + "_pin' value='" + String(sensorConfig.configured ? String(sensorConfig.pin) : String("")) + "'>";
+    body += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_scale' name='exp_" + String(sensorDefinition.key) + "_scale' value='" + String(sensorConfig.scale, 6) + "'>";
+    body += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_offset' name='exp_" + String(sensorDefinition.key) + "_offset' value='" + String(sensorConfig.offset, 6) + "'>";
+    body += "</div></div>";
+  }
+  body += "</div></div></div></div>";
+  body += "<div class='col-12'><p class='form-text mb-0'>Configure the input profile before enabling a field. Analog inputs use volts × scale + offset; pulse inputs use pulse rate × scale + offset, except rain which uses pulse total × scale + offset. Save and reboot after changing a profile or its enabled state.</p></div>";
+  body += "<dialog id='expSensorSetupDialog' style='background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:560px;width:92vw;color:var(--text);'>";
+  body += "<h3 class='h5' id='expSensorSetupTitle'>Configure EXP input</h3><p class='hint' id='expSensorSetupHelp'></p>";
+  body += "<div id='expSensorAnalogPinRow'><label class='form-label' for='expSensorAnalogPin'>ADC1 GPIO</label><select class='form-select' id='expSensorAnalogPin'><option value=''>Select ADC1 GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){32, 33, 34, 35, 36, 39}, 6, true) + "</select></div>";
+  body += "<div id='expSensorPulsePinRow'><label class='form-label' for='expSensorPulsePin'>Digital pulse GPIO</label><select class='form-select' id='expSensorPulsePin'><option value=''>Select GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39}, 22, false) + "</select><div class='form-text'>Pulse inputs use an internal pull-up and count falling edges.</div></div>";
+  body += "<div class='row g-3 mt-1'><div class='col-6'><label class='form-label' for='expSensorScale'>Scale</label><input class='form-control mono' id='expSensorScale' type='number' min='0.000001' step='any' value='1'></div><div class='col-6'><label class='form-label' for='expSensorOffset'>Offset</label><input class='form-control mono' id='expSensorOffset' type='number' step='any' value='0'></div></div>";
+  body += "<div class='d-flex justify-content-between gap-2 mt-4'><button type='button' class='btn btn-outline-secondary' id='expSensorClear'>Clear profile</button><div class='d-flex gap-2'><button type='button' class='btn btn-outline-secondary' id='expSensorCancel'>Cancel</button><button type='button' class='btn btn-primary' id='expSensorApply'>Use profile</button></div></div></dialog>";
 
   body += "<div class='col-12 d-flex flex-wrap gap-2 pt-2'><button type='submit' class='btn btn-primary'>Save Settings</button><button type='submit' formaction='/reboot' formmethod='post' class='btn btn-warning'>Save and Reboot</button><button type='submit' formaction='/restart' formmethod='post' class='btn btn-outline-secondary'>Reboot Only</button><a class='btn btn-outline-secondary' href='/ota-check'>Review OTA Status</a><a class='btn btn-outline-secondary' href='/update'>Open OTA Update</a></div>";
+  body += "<dialog id='hardwarePinSetupDialog' style='background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:560px;width:92vw;color:var(--text);'><h3 class='h5' id='hardwarePinSetupTitle'>Configure sensor pins</h3><p class='hint' id='hardwarePinSetupHelp'></p>";
+  body += "<div id='hardwareI2cRows'><div class='mb-3'><label class='form-label' for='hardwarePinSda'>SDA</label><select class='form-select' id='hardwarePinSda'><option value=''>Select SDA GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select></div><div><label class='form-label' for='hardwarePinScl'>SCL</label><select class='form-select' id='hardwarePinScl'><option value=''>Select SCL GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select></div></div>";
+  body += "<div id='hardwareAnalogRow'><label class='form-label' for='hardwareAnalogPin'>ADC1 GPIO</label><select class='form-select' id='hardwareAnalogPin'><option value=''>Select ADC1 GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){32, 33, 34, 35, 36, 39}, 6, true) + "</select></div>";
+  body += "<div id='hardwarePulseRow'><label class='form-label' for='hardwarePulsePin'>Digital input GPIO</label><select class='form-select' id='hardwarePulsePin'><option value=''>Select GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39}, 22, false) + "</select></div>";
+  body += "<div class='d-flex justify-content-end gap-2 mt-4'><button type='button' class='btn btn-outline-secondary' id='hardwarePinCancel'>Cancel</button><button type='button' class='btn btn-primary' id='hardwarePinApply'>Apply pins</button></div></dialog>";
   body += "</form></div></div></div>";
 
-  body += "<div class='col-12 col-xl-4'><div class='card'><div class='card-body'>";
-  body += "<h2 class='h5 mb-3'>Notes</h2>";
-  body += "<ul class='mb-0 ps-3 hint'><li>WiFi and hostname changes need a reboot before they take effect.</li><li>Timezone, DST, calibration, and history settings are saved in NVS and can be adjusted without rebuilding the firmware.</li><li>Upload platforms can now be disabled independently from this page if you only want local monitoring.</li><li>Credentials are stored in NVS on the device and are no longer limited to build-time secrets.</li><li>Tube presets live in <span class='mono'>logger_user_config.h</span> so builders can ship cleaner defaults.</li><li>The compiled <span class='mono'>arduino_secrets.h</span> values remain as fallback defaults.</li><li>The OTA update page is still served by the ElegantOTA library.</li></ul>";
+  body += "<div class='col-12 col-xl-3'><div class='card h-100'><div class='card-body'>";
+  body += "<h2 class='h5 mb-3'>Setup Notes</h2>";
+  body += "<h3 class='h6'>I2C discovery</h3><p class='hint'>The bus is scanned automatically at boot using the selected SDA/SCL pins. Known addresses are labeled BME680 (0x76/0x77), HM3301 (0x40), and TSL2561 (0x29/0x39/0x49); other responding addresses are listed as unidentified. Reboot after changing bus pins.</p>";
+  body += "<h3 class='h6'>Sensor pins</h3><p class='hint'>Use Configure beside a sensor to select its GPIO. Analog sensors use <span class='mono'>volts x scale + offset</span>; use the module datasheet to calculate scale/offset. Do not feed more than 3.3 V to an ESP32 input.</p><p class='hint'>Pulse sensors count falling edges. Use a compatible pulse/collector output and set scale to the sensor's units per pulse or per pulse/second. Save and reboot after pin changes.</p>";
+  body += "<h3 class='h6'>Radiation tubes</h3><p class='hint'>Each tube has its own preset, dead time, and dose conversion. Preset values are locked; choose Custom to calibrate. EXP field 10 carries Tube 1's type because EXP defines only one tube-type field.</p>";
+  body += "<h3 class='h6'>EXP uploads</h3><p class='hint'>Timestamp (01) is mandatory. Other fields are independently selectable. Extra analog/pulse inputs require an installed compatible sensor and a calibrated scale/offset before enabling them.</p>";
+  body += "<h3 class='h6'>Network and storage</h3><p class='hint'>WiFi credentials and runtime settings are stored in NVS. WiFi/hostname changes require reboot. Keep SPIFFS history within the available partition and retain access to the device's OTA page.</p>";
+  body += "<p class='hint mb-0'>Tube presets live in <span class='mono'>logger_user_config.h</span>. Compiled credentials in <span class='mono'>arduino_secrets.h</span> are fallbacks.</p>";
   body += "</div></div></div></div>";
 
-  body += "<script>(function(){var preset=document.getElementById('tube_preset');var dead=document.getElementById('tube_dead_time_us');var conv=document.getElementById('tube_conversion_factor');var hint=document.getElementById('tubePresetHint');var voltage=document.getElementById('tubeVoltageRange');var note=document.getElementById('tubeProfileNote');var profileName=document.getElementById('tubeProfileName');var dstProfile=document.getElementById('dst_profile');var dstOffset=document.getElementById('dst_offset_minutes');if(!preset||!dead||!conv){return;}function readVoltageRange(option){var vmin=option?option.getAttribute('data-vmin'):'';var vmax=option?option.getAttribute('data-vmax'):'';if(!vmin||!vmax){return 'Verify against datasheet';}return vmin+'-'+vmax+' V';}function syncTubeFields(){var option=preset.options[preset.selectedIndex];var isCustom=preset.value==='custom';dead.readOnly=!isCustom;conv.readOnly=!isCustom;dead.setAttribute('aria-readonly',isCustom?'false':'true');conv.setAttribute('aria-readonly',isCustom?'false':'true');if(!isCustom&&option){dead.value=option.getAttribute('data-dead-us')||dead.value;conv.value=option.getAttribute('data-conv')||conv.value;}if(hint){hint.textContent=isCustom?'Custom keeps the values below editable and saves them in NVS.':'Preset values are loaded from logger_user_config.h and copied into the fields automatically.';}if(voltage){voltage.textContent=readVoltageRange(option);}if(note&&option){note.textContent=option.getAttribute('data-note')||'';}if(profileName&&option){profileName.textContent=option.text.split(' (')[0]||option.text;}}function syncDstFields(){if(!dstProfile||!dstOffset){return;}var disabled=dstProfile.value==='none';dstOffset.readOnly=disabled;dstOffset.setAttribute('aria-readonly',disabled?'true':'false');if(disabled&&(!dstOffset.value||dstOffset.value==='')){dstOffset.value='0';}}preset.addEventListener('change',syncTubeFields);if(dstProfile){dstProfile.addEventListener('change',syncDstFields);}syncTubeFields();syncDstFields();})();</script>";
+  body += "<script>(function(){var preset=document.getElementById('tube_preset');var dead=document.getElementById('tube_dead_time_us');var conv=document.getElementById('tube_conversion_factor');var hint=document.getElementById('tubePresetHint');var voltage=document.getElementById('tubeVoltageRange');var note=document.getElementById('tubeProfileNote');var profileName=document.getElementById('tubeProfileName');var dstProfile=document.getElementById('dst_profile');var dstOffset=document.getElementById('dst_offset_minutes');var dualTubeToggle=document.getElementById('dual_tube_enabled');var tube2PinRow=document.getElementById('tube2PinRow');var tube2Pin=document.getElementById('tube2_pin');if(!preset||!dead||!conv){return;}function readVoltageRange(option){var vmin=option?option.getAttribute('data-vmin'):'';var vmax=option?option.getAttribute('data-vmax'):'';if(!vmin||!vmax){return 'Verify against datasheet';}return vmin+'-'+vmax+' V';}function syncTubeFields(){var option=preset.options[preset.selectedIndex];var isCustom=preset.value==='custom';dead.readOnly=!isCustom;conv.readOnly=!isCustom;dead.setAttribute('aria-readonly',isCustom?'false':'true');conv.setAttribute('aria-readonly',isCustom?'false':'true');if(!isCustom&&option){dead.value=option.getAttribute('data-dead-us')||dead.value;conv.value=option.getAttribute('data-conv')||conv.value;}if(hint){hint.textContent=isCustom?'Custom keeps the values below editable and saves them in NVS.':'Preset values are loaded from logger_user_config.h and copied into the fields automatically.';}if(voltage){voltage.textContent=readVoltageRange(option);}if(note&&option){note.textContent=option.getAttribute('data-note')||'';}if(profileName&&option){profileName.textContent=option.text.split(' (')[0]||option.text;}}function syncDstFields(){if(!dstProfile||!dstOffset){return;}var disabled=dstProfile.value==='none';dstOffset.readOnly=disabled;dstOffset.setAttribute('aria-readonly',disabled?'true':'false');if(disabled&&(!dstOffset.value||dstOffset.value==='')){dstOffset.value='0';}}function syncDualTubeFields(){if(!dualTubeToggle||!tube2PinRow||!tube2Pin){return;}var enabled=dualTubeToggle.checked;tube2PinRow.style.display=enabled?'':'none';tube2Pin.disabled=!enabled;tube2Pin.setAttribute('aria-disabled',enabled?'false':'true');}preset.addEventListener('change',syncTubeFields);if(dstProfile){dstProfile.addEventListener('change',syncDstFields);}if(dualTubeToggle){dualTubeToggle.addEventListener('change',syncDualTubeFields);}syncTubeFields();syncDstFields();syncDualTubeFields();})();</script>";
 
+  body += "<script>(function(){function byId(id){return document.getElementById(id);}var dialog=byId('expSensorSetupDialog');var analogRow=byId('expSensorAnalogPinRow');var pulseRow=byId('expSensorPulsePinRow');var analogPin=byId('expSensorAnalogPin');var pulsePin=byId('expSensorPulsePin');var scaleInput=byId('expSensorScale');var offsetInput=byId('expSensorOffset');var help=byId('expSensorSetupHelp');var title=byId('expSensorSetupTitle');var activeKey='';var activeMode='';function syncSensor(key){var pin=byId('exp_'+key+'_pin');var scale=byId('exp_'+key+'_scale');var offset=byId('exp_'+key+'_offset');var checkbox=byId('exp_sensor_'+key);var status=byId('exp_'+key+'_status');var scaleValue=Number(scale.value);var offsetValue=Number(offset.value);var ready=Boolean(pin.value)&&Number.isFinite(scaleValue)&&scaleValue>0&&Number.isFinite(offsetValue);checkbox.disabled=!ready;if(!ready){checkbox.checked=false;}status.textContent=ready?'GPIO'+pin.value+' | scale '+scaleValue+' | offset '+offsetValue:'Pin and calibration not configured';}document.querySelectorAll('[data-exp-setup]').forEach(function(button){button.addEventListener('click',function(){activeKey=button.getAttribute('data-exp-setup');activeMode=button.getAttribute('data-exp-mode');title.textContent=button.getAttribute('data-exp-label')+' setup';var currentPin=byId('exp_'+activeKey+'_pin').value;if(activeMode==='analog'){analogRow.style.display='';pulseRow.style.display='none';analogPin.value=currentPin;}else{analogRow.style.display='none';pulseRow.style.display='';pulsePin.value=currentPin;}scaleInput.value=byId('exp_'+activeKey+'_scale').value||'1';offsetInput.value=byId('exp_'+activeKey+'_offset').value||'0';help.textContent=activeMode==='analog'?'Formula: value = ADC voltage in volts × scale + offset. Use a conditioned linear analog output; never apply more than 3.3 V to an ESP32 ADC pin.':(activeMode==='pulse-total'?'Formula: value = pulse count in the upload interval × scale + offset.':'Formula: value = pulse rate in pulses/second × scale + offset.');dialog.showModal();});});byId('expSensorApply').addEventListener('click',function(){var selectedPin=activeMode==='analog'?analogPin.value:pulsePin.value;var scaleValue=Number(scaleInput.value);var offsetValue=Number(offsetInput.value);if(!selectedPin||!Number.isFinite(scaleValue)||scaleValue<=0||!Number.isFinite(offsetValue)){help.textContent='Select a GPIO and enter a positive scale plus a valid offset.';return;}byId('exp_'+activeKey+'_pin').value=selectedPin;byId('exp_'+activeKey+'_scale').value=String(scaleValue);byId('exp_'+activeKey+'_offset').value=String(offsetValue);syncSensor(activeKey);dialog.close();});byId('expSensorClear').addEventListener('click',function(){if(!activeKey){return;}byId('exp_'+activeKey+'_pin').value='';byId('exp_'+activeKey+'_scale').value='1';byId('exp_'+activeKey+'_offset').value='0';syncSensor(activeKey);dialog.close();});byId('expSensorCancel').addEventListener('click',function(){dialog.close();});document.querySelectorAll('[data-exp-setup]').forEach(function(button){syncSensor(button.getAttribute('data-exp-setup'));});})();</script>";
+  body += "<script>(function(){var dual=document.getElementById('dual_tube_enabled');var section=document.getElementById('tube2ProfileSection');var preset=document.getElementById('tube2_preset');var dead=document.getElementById('tube2_dead_time_us');var conv=document.getElementById('tube2_conversion_factor');var range=document.getElementById('tube2VoltageRange');var note=document.getElementById('tube2ProfileNote');var name=document.getElementById('tube2ProfileName');if(!dual||!section||!preset||!dead||!conv){return;}function syncPreset(){var option=preset.options[preset.selectedIndex];var custom=preset.value==='custom';dead.readOnly=!custom;conv.readOnly=!custom;dead.setAttribute('aria-readonly',custom?'false':'true');conv.setAttribute('aria-readonly',custom?'false':'true');if(!custom&&option){dead.value=option.getAttribute('data-dead-us')||dead.value;conv.value=option.getAttribute('data-conv')||conv.value;}if(range&&option){var low=option.getAttribute('data-vmin');var high=option.getAttribute('data-vmax');range.textContent=low&&high?low+'-'+high+' V':'Verify against datasheet';}if(note&&option){note.textContent=option.getAttribute('data-note')||'';}if(name&&option){name.textContent=option.text.split(' (')[0]||option.text;}}function syncSection(){var enabled=dual.checked;section.style.display=enabled?'':'none';[preset,dead,conv].forEach(function(control){control.disabled=!enabled;});}preset.addEventListener('change',syncPreset);dual.addEventListener('change',syncSection);syncPreset();syncSection();})();</script>";
+  body += "<script>(function(){function syncCode(selectId,codeId){var select=document.getElementById(selectId);var code=document.getElementById(codeId);if(!select||!code){return;}function update(){var option=select.options[select.selectedIndex];code.textContent=option?option.getAttribute('data-exp-id')||'0x00':'0x00';}select.addEventListener('change',update);update();}syncCode('tube_preset','tubeExpCode');syncCode('tube2_preset','tube2ExpCode');})();</script>";
+  body += "<script>(function(){function byId(id){return document.getElementById(id);}var dialog=byId('hardwarePinSetupDialog');var title=byId('hardwarePinSetupTitle');var help=byId('hardwarePinSetupHelp');var i2cRows=byId('hardwareI2cRows');var analogRow=byId('hardwareAnalogRow');var pulseRow=byId('hardwarePulseRow');var sda=byId('hardwarePinSda');var scl=byId('hardwarePinScl');var analogPin=byId('hardwareAnalogPin');var pulsePin=byId('hardwarePulsePin');var target='';var mode='';document.querySelectorAll('[data-pin-setup]').forEach(function(button){button.addEventListener('click',function(){target=button.getAttribute('data-pin-setup');mode=target==='i2c'?'i2c':((target==='hv_adc_pin'||target==='hcho_adc_pin')?'analog':'pulse');title.textContent='Configure '+(target==='i2c'?'shared I2C bus':target.replaceAll('_',' '));i2cRows.style.display=mode==='i2c'?'':'none';analogRow.style.display=mode==='analog'?'':'none';pulseRow.style.display=mode==='pulse'?'':'none';if(mode==='i2c'){sda.value=byId('i2c_sda_pin').value;scl.value=byId('i2c_scl_pin').value;help.textContent='These pins are shared by BME680, HM3301, and TSL2561. Reboot after applying.';}else if(mode==='analog'){analogPin.value=byId(target).value;help.textContent='Select an ADC1 input. Never apply more than 3.3 V to an ESP32 GPIO.';}else{pulsePin.value=byId(target).value;help.textContent='Select a digital input GPIO. Reboot after applying pin changes.';}dialog.showModal();});});byId('hardwarePinApply').addEventListener('click',function(){if(mode==='i2c'){if(!sda.value||!scl.value||sda.value===scl.value){help.textContent='Select two distinct GPIO pins for SDA and SCL.';return;}byId('i2c_sda_pin').value=sda.value;byId('i2c_scl_pin').value=scl.value;byId('pinSummary_i2c').textContent='GPIO'+sda.value+' / GPIO'+scl.value;}else{var pin=mode==='analog'?analogPin.value:pulsePin.value;if(!pin){help.textContent='Select a GPIO pin before applying.';return;}byId(target).value=pin;var summary=byId('pinSummary_'+target);if(summary){summary.textContent='GPIO'+pin;}}dialog.close();});byId('hardwarePinCancel').addEventListener('click',function(){dialog.close();});var dual=byId('dual_tube_enabled');var tube2Row=byId('tube2PinConfigRow');if(dual&&tube2Row){function updateTube2Pin(){tube2Row.style.display=dual.checked?'':'none';}dual.addEventListener('change',updateTube2Pin);updateTube2Pin();}})();</script>";
+  body += "<script>(function(){var dialog=document.getElementById('hardwarePinSetupDialog');var title=document.getElementById('hardwarePinSetupTitle');var help=document.getElementById('hardwarePinSetupHelp');var i2cRows=document.getElementById('hardwareI2cRows');var analogRow=document.getElementById('hardwareAnalogRow');var pulseRow=document.getElementById('hardwarePulseRow');var sda=document.getElementById('hardwarePinSda');var scl=document.getElementById('hardwarePinScl');var analogPin=document.getElementById('hardwareAnalogPin');var pulsePin=document.getElementById('hardwarePulsePin');var target='';var mode='';document.querySelectorAll('[data-pin-setup]').forEach(function(button){button.addEventListener('click',function(){target=button.getAttribute('data-pin-setup');mode=target==='i2c'?'i2c':((target==='hv_adc_pin'||target==='hcho_adc_pin')?'analog':'pulse');title.textContent='Configure '+(target==='i2c'?'shared I2C bus':target.replace(/_/g,' '));i2cRows.style.display=mode==='i2c'?'':'none';analogRow.style.display=mode==='analog'?'':'none';pulseRow.style.display=mode==='pulse'?'':'none';if(mode==='i2c'){sda.value=document.getElementById('i2c_sda_pin').value;scl.value=document.getElementById('i2c_scl_pin').value;help.textContent='Shared by BME680, HM3301, and TSL2561. Reboot after saving pin changes.';}else if(mode==='analog'){analogPin.value=document.getElementById(target).value;help.textContent='Choose an ADC1 pin. Never apply more than 3.3 V to an ESP32 GPIO.';}else{pulsePin.value=document.getElementById(target).value;help.textContent='Choose a supported digital input pin. Reboot after saving pin changes.';}dialog.showModal();});});document.getElementById('hardwarePinApply').addEventListener('click',function(){if(mode==='i2c'){if(!sda.value||!scl.value||sda.value===scl.value){help.textContent='Select distinct SDA and SCL pins.';return;}document.getElementById('i2c_sda_pin').value=sda.value;document.getElementById('i2c_scl_pin').value=scl.value;document.getElementById('pinSummary_i2c').textContent='GPIO'+sda.value+' / GPIO'+scl.value;}else{var pin=mode==='analog'?analogPin.value:pulsePin.value;if(!pin){help.textContent='Select a pin before applying.';return;}document.getElementById(target).value=pin;var summary=document.getElementById('pinSummary_'+target);if(summary){summary.textContent='GPIO'+pin;}}dialog.close();});document.getElementById('hardwarePinCancel').addEventListener('click',function(){dialog.close();});var dual=document.getElementById('dual_tube_enabled');var tube2Row=document.getElementById('tube2PinConfigRow');if(dual&&tube2Row){function syncTube2(){tube2Row.style.display=dual.checked?'':'none';}dual.addEventListener('change',syncTube2);syncTube2();}})();</script>";
+  body += "<script>(function(){var sequence=['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','b','a'];var position=0;var active=false;document.addEventListener('keydown',function(event){var key=event.key.length===1?event.key.toLowerCase():event.key;if(key===sequence[position]){event.preventDefault();position++;if(position===sequence.length){position=0;if(active){return;}active=true;var overlay=document.createElement('div');overlay.id='pythonFootSmash';overlay.innerHTML='<div class=\"smash-foot\">&#129718;</div><div class=\"smash-caption\">THWACK! Page flattened.</div>';overlay.style.cssText='position:fixed;inset:0;z-index:100000;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(8,12,18,.78);color:white;pointer-events:none;';var style=document.createElement('style');style.textContent='@keyframes page-smush{0%{transform:scaleY(1)}30%{transform:scaleY(.035)}60%{transform:scaleY(.12)}100%{transform:scaleY(1)}}@keyframes foot-stomp{0%{transform:translateY(-80vh) rotate(-24deg) scale(1.8)}52%{transform:translateY(5vh) rotate(0) scale(1)}72%{transform:translateY(-3vh) scale(.9)}100%{transform:translateY(0) scale(1)}}body.konami-smushed>main.page-shell{transform-origin:center center;animation:page-smush 900ms ease-in-out}#pythonFootSmash .smash-foot{font-size:clamp(8rem,38vw,24rem);line-height:.85;animation:foot-stomp 900ms cubic-bezier(.22,.8,.25,1)}#pythonFootSmash .smash-caption{font-size:1.25rem;font-weight:700;text-align:center;margin-top:1rem}';document.head.appendChild(style);document.body.appendChild(overlay);document.body.classList.add('konami-smushed');setTimeout(function(){document.body.classList.remove('konami-smushed');overlay.remove();style.remove();active=false;},1800);}}else{position=key===sequence[0]?1:0;}});})();</script>";
+  body += "<script>(function(){var dialog=document.getElementById('hardwarePinSetupDialog');function update(){var sda=document.getElementById('i2c_sda_pin').value;var scl=document.getElementById('i2c_scl_pin').value;document.querySelectorAll('[data-pin-summary=i2c]').forEach(function(node){node.textContent='GPIO'+sda+' / GPIO'+scl;});['hv_adc_pin','hcho_adc_pin','tube1_pin','tube2_pin'].forEach(function(key){var select=document.getElementById(key);document.querySelectorAll('[data-pin-summary='+key+']').forEach(function(node){node.textContent='GPIO'+select.value;});});}if(dialog){dialog.addEventListener('close',update);}update();})();</script>";
   server.send(200, "text/html; charset=utf-8", adminPageShell("Device Configuration", "Edit runtime WiFi and upload credentials stored on the ESP32.", body));
 }
 
@@ -2822,14 +3742,14 @@ static float estimateHvDriveUploadPct(float voltage)
   return estimateHvDrivePct(voltage);
 }
 
-static unsigned long applyDeadTimeCorrection(int rawCps, const char *tubeLabel)
+static unsigned long applyDeadTimeCorrection(int rawCps, float deadTimeSeconds, const char *tubeLabel)
 {
   if (rawCps <= 0)
   {
     return 0UL;
   }
 
-  float denominator = 1.0f - (rawCps * activeTubeDeadTimeSeconds);
+  float denominator = 1.0f - (rawCps * deadTimeSeconds);
   if (denominator <= 0.0f)
   {
     unsigned long now = millis();
@@ -3384,7 +4304,7 @@ std::vector<String> webPageChunks()
     "body[data-theme='light']{--bg:#eff4f8;--bg-soft:#f7fafc;--card:#ffffff;--border:#d4dee8;--text:#17212b;--muted:#5d6d7d;--accent:#1e6bd6;--accent-strong:#1451a8;--tableHead:#e5eef6;--tableRow:#f8fbfd;--chip:#eef3f7;--gaugeBg:#d8e1ea;--shadow:rgba(22,41,66,.12);--heroA:#ddebf7;--heroB:#f7fbff;--surface:rgba(255,255,255,.72);color-scheme:light;}"
     "*{box-sizing:border-box;margin:0;padding:0;}"
     "body{background:radial-gradient(circle at top,var(--heroA),var(--bg) 38%);color:var(--text);font-family:Segoe UI,Arial,sans-serif;transition:background-color .25s,color .25s;}"
-    ".page-shell{max-width:1240px;margin:0 auto;padding:20px 16px 28px;}"
+    ".page-shell{max-width:1480px;margin:0 auto;padding:20px 20px 28px;}"
     ".topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:12px 14px;border:1px solid var(--border);border-radius:18px;background:var(--surface);backdrop-filter:blur(12px);box-shadow:0 12px 28px var(--shadow);}"
     ".brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.02em;color:var(--text);}"
     ".brand-mark{width:34px;height:34px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;font-size:1rem;box-shadow:0 8px 18px rgba(33,109,214,.28);}"
@@ -3457,7 +4377,7 @@ std::vector<String> webPageChunks()
   );
 
   // ── RADIATION CARDS ───────────────────────────────────────────────────────
-  float usv   = outputSieverts(cpm);
+  float usv   = currentOutputSieverts();
   String dCol = doseColour(usv);
   String hvCol = hvColour(tubeVoltage);
   float hvDrivePct = estimateHvDrivePct(tubeVoltage);
@@ -3486,12 +4406,14 @@ std::vector<String> webPageChunks()
       "<div class='card-title'>Tube 1 CPS</div>"
       "<div id='tube1Value' class='card-value'>" + String(actual_cps_1) + "</div>"
       "<div class='card-unit'>counts / s</div>"
+      "<div id='tube1DeadtimeInfo' class='card-detail' style='margin-top:6px;font-size:.72rem;color:var(--muted);'>raw " + String(raw_cps_1) + " → corrected " + String(actual_cps_1) + "</div>"
     "</div>"
     // Tube 2
-    + "<div class='card'>"
+    + "<div class='card' id='tube2Card'>"
       "<div class='card-title'>Tube 2 CPS</div>"
       "<div id='tube2Value' class='card-value'>" + String(actual_cps_2) + "</div>"
       "<div class='card-unit'>counts / s</div>"
+      "<div id='tube2DeadtimeInfo' class='card-detail' style='margin-top:6px;font-size:.72rem;color:var(--muted);'>raw " + String(raw_cps_2) + " → corrected " + String(actual_cps_2) + "</div>"
     "</div>"
     // Tube 1 CPM
     + "<div class='card'>"
@@ -3500,7 +4422,7 @@ std::vector<String> webPageChunks()
       "<div class='card-unit'>counts per minute</div>"
     "</div>"
     // Tube 2 CPM
-    + "<div class='card'>"
+    + "<div class='card' id='cpm2Card'>"
       "<div class='card-title'>Tube 2 CPM</div>"
       "<div id='cpm2Value' class='card-value'>" + String(cpm2) + "</div>"
       "<div class='card-unit'>counts per minute</div>"
@@ -3886,9 +4808,16 @@ std::vector<String> webPageChunks()
     + "  byId('doseGauge').style.background=color;"
     + "  setText('cpmValue',String(Math.round(cpm)));"
     + "  setText('tube1Value',String(Math.round(tube1)));"
-    + "  setText('tube2Value',String(Math.round(tube2)));"
+    + "  const dualTubeEnabled=Boolean(d.dualTubeEnabled);"
+    + "  const tube2Card=byId('tube2Card');"
+    + "  const cpm2Card=byId('cpm2Card');"
+    + "  if(tube2Card) tube2Card.style.display=dualTubeEnabled?'':'none';"
+    + "  if(cpm2Card) cpm2Card.style.display=dualTubeEnabled?'':'none';"
+    + "  if(!dualTubeEnabled){setText('tube2Value','0');if(byId('tube2DeadtimeInfo')) byId('tube2DeadtimeInfo').textContent='tube 2 disabled';}"
+    + "  else {setText('tube2Value',String(Math.round(tube2)));const raw1=Number(d.rawTube1)||0;const raw2=Number(d.rawTube2)||0;const deadTimeUs=Number(d.tubeDeadTimeUs)||0;const deadTimeFactor1 = raw1>0 ? (1 - (raw1 * deadTimeUs / 1000000)) : 1;const deadTimeFactor2 = raw2>0 ? (1 - (raw2 * deadTimeUs / 1000000)) : 1;if(byId('tube1DeadtimeInfo')) byId('tube1DeadtimeInfo').textContent='raw '+String(raw1)+' -> corrected '+String(Math.round(tube1))+' | factor '+deadTimeFactor1.toFixed(3);if(byId('tube2DeadtimeInfo')) byId('tube2DeadtimeInfo').textContent='raw '+String(raw2)+' -> corrected '+String(Math.round(tube2))+' | factor '+deadTimeFactor2.toFixed(3);}"
     + "  setText('cpm1Value',String(Math.round(Number(d.cpm1)||0)));"
     + "  setText('cpm2Value',String(Math.round(Number(d.cpm2)||0)));"
+    + "  if(!dualTubeEnabled){if(byId('cpm2Value')) byId('cpm2Value').textContent='0';}"
     + "  setText('hvValue',hv.toFixed(1));"
     + "  byId('hvGauge').style.width=clamp(Math.round(hv*100/500),0,100)+'%';"
     + "  byId('hvGauge').style.background=hvColor(hv);"
@@ -4025,6 +4954,7 @@ String JsonPage()
   doc["pm10"] = var_pm10;
   doc["tubeVoltage"] = tubeVoltage;
   doc["estimatedHvDrivePct"] = estimateHvDrivePct(tubeVoltage);
+  doc["dualTubeEnabled"] = activeDualTubeEnabled;
   doc["tubePresetId"] = activeTubePresetId;
   doc["tubePresetLabel"] = activeTubePresetLabel;
   doc["tubeDeadTimeUs"] = activeTubeDeadTimeSeconds * 1000000.0f;
@@ -4067,10 +4997,12 @@ String JsonPage()
   doc["totalcpm"] = cpm;
   doc["tube1"] = actual_cps_1;
   doc["tube2"] = actual_cps_2;
+  doc["rawTube1"] = raw_cps_1;
+  doc["rawTube2"] = raw_cps_2;
   doc["cpm1"] = cpm1;
   doc["cpm2"] = cpm2;
   doc["sensorMovingAvg"] = sensorMovingAvg;
-  doc["outputSieverts"] = outputSieverts(cpm);
+  doc["outputSieverts"] = currentOutputSieverts();
   doc["statusCodeRadmon"] = uploadStatus.statusCodeRadmon;
   doc["statusCodeURadmon"] = uploadStatus.statusCodeURadmon;
   doc["radmonUploadEnabled"] = activeRadmonUploadEnabled;
@@ -4123,4 +5055,26 @@ String JsonPage()
   serializeJson(doc, json);
 
   return json;
+}
+
+static bool isValidWroverI2cPin(const int pinNumber)
+{
+  switch (pinNumber)
+  {
+    case 4:
+    case 5:
+    case 18:
+    case 19:
+    case 21:
+    case 22:
+    case 23:
+    case 25:
+    case 26:
+    case 27:
+    case 32:
+    case 33:
+      return true;
+    default:
+      return false;
+  }
 }
