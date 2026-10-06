@@ -252,7 +252,7 @@ a{color:var(--accent);}
 <div class="chart-card"><h3>CO₂</h3><canvas id="cCo2" height="80"></canvas></div>
 <div class="chart-card"><h3>Particulates</h3><canvas id="cPm" height="80"></canvas></div>
 
-<footer>&copy; 2022&ndash;2026 &middot; By <a href="https://www.don-zalmrol.be/" target="_blank" rel="noopener">Don Zalmrol</a> &middot; <a href="https://github.com/DonZalmrol" target="_blank" rel="noopener">GitHub</a> &middot; <span style="font-family:monospace">v1.4d</span></footer>
+<footer>&copy; 2022&ndash;2026 &middot; By <a href="https://www.don-zalmrol.be/" target="_blank" rel="noopener">Don Zalmrol</a> &middot; <a href="https://github.com/DonZalmrol" target="_blank" rel="noopener">GitHub</a> &middot; <span style="font-family:monospace">v1.4e</span></footer>
 </main>
 
 <script>
@@ -302,6 +302,39 @@ a{color:var(--accent);}
   mkChart('cIaq',[ds('IAQ',palette.iaq,noise(48.2,4))]);
   mkChart('cCo2',[ds('CO2 ppm',palette.co2,noise(412,12))]);
   mkChart('cPm',[ds('PM1.0',palette.pm1,noiseInt(3,1)),ds('PM2.5',palette.pm25,noiseInt(5,1)),ds('PM10',palette.pm10,noiseInt(6,2))]);
+})();
+</script>
+<div style="position:fixed;right:12px;bottom:12px;z-index:50;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 12px;font-size:.78rem;max-width:260px;">
+<div style="font-weight:600;margin-bottom:6px;">Mock: EXP sensor toggles</div>
+<div id="expDemoBoxes" style="display:flex;flex-wrap:wrap;gap:4px 10px;"></div>
+</div>
+<script>
+(function(){
+  // Mirrors firmware: a disabled EXP sensor hides its cards and chart.
+  var groups=[
+    {k:'CPM',titles:['Dose Rate','CPM (2-tube','Tube 1 CPS','Tube 2 CPS','Tube 1 CPM','Tube 2 CPM'],charts:['cDose','cCpm','cCps']},
+    {k:'HV',titles:['Tube High Voltage'],charts:[]},
+    {k:'HV duty',titles:['HV Drive Index'],charts:[]},
+    {k:'VOC/IAQ',titles:['IAQ','VOC'],charts:['cIaq']},
+    {k:'CO2',titles:['CO'],charts:['cCo2']},
+    {k:'HCHO',titles:['Formaldehyde'],charts:[]},
+    {k:'PM',titles:['PM 1.0','PM 2.5','PM 10'],charts:['cPm']},
+    {k:'Temp',titles:['Temperature'],charts:[]},
+    {k:'Humidity',titles:['Humidity'],charts:[]},
+    {k:'Pressure',titles:['Pressure'],charts:[]},
+    {k:'Lux',titles:['Luminosity'],charts:[]}
+  ];
+  var box=document.getElementById('expDemoBoxes');
+  function apply(g,on){
+    document.querySelectorAll('.card').forEach(function(c){var t=c.querySelector('.card-title');if(t&&g.titles.some(function(x){return t.textContent.trim().indexOf(x)===0;})){c.style.display=on?'':'none';}});
+    g.charts.forEach(function(id){var n=document.getElementById(id);if(n&&n.closest('.chart-card')){n.closest('.chart-card').style.display=on?'':'none';}});
+  }
+  groups.forEach(function(g){
+    var l=document.createElement('label');
+    l.innerHTML='<input type="checkbox" checked> '+g.k;
+    l.querySelector('input').addEventListener('change',function(e){apply(g,e.target.checked);});
+    box.appendChild(l);
+  });
 })();
 </script>
 </body>
