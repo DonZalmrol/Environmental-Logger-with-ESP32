@@ -1,6 +1,6 @@
 # Environmental Stationary Logger
 
-> **Firmware version:** v1.4d &nbsp;|&nbsp; **Platform:** ESP32 Wrover-E &nbsp;|&nbsp; **Framework:** Arduino (ESP-IDF v5)
+> **Firmware version:** v1.4e &nbsp;|&nbsp; **Platform:** ESP32 Wrover-E &nbsp;|&nbsp; **Framework:** Arduino (ESP-IDF v5)
 
 A full-featured environmental monitoring station built around the ESP32 Wrover-E.  
 It continuously samples ionising radiation (two GM tubes), air quality (IAQ / CO₂ / VOC / HCHO), particulate matter, temperature, pressure, humidity and visible light, then presents everything through a live web dashboard and uploads a summary to public radiation-monitoring platforms every 61 seconds.
@@ -37,6 +37,8 @@ It continuously samples ionising radiation (two GM tubes), air quality (IAQ / CO
 - **Nine built-in tube presets** + fully custom dead-time / conversion-factor entry
 - **DST profiles** — EU, US, AU or None, selectable at runtime
 - **OTA firmware updates** via ElegantOTA
+- **Optional admin login** — HTTP auth for `/config`, admin actions and `/update` when `SECRET_ADMIN_PASS` is defined
+- **Resilient networking** — WiFi auto-reconnect, 60 s boot timeout with restart, uploads try HTTPS first and fall back to HTTP
 - **Per-core CPU load** and heap / SPIFFS diagnostics exposed on the dashboard and in `/json`
 - **Fully offline** — no external CDN in the UI shell; Chart.js is the only remote resource
 
@@ -290,7 +292,7 @@ Headers:
   X-Payload:   T<temp>|P<pressure>|H<humidity>|L<lux>|V<hv>|W<voc>|F<hcho>|...
 ```
 
-> Both endpoints use plain HTTP (no TLS).  
+> Uploads try HTTPS first and fall back to plain HTTP (`UPLOAD_ALLOW_HTTP_FALLBACK`); radmon credentials are URL-encoded.  
 > Credentials are stored in `arduino_secrets.h` (git-ignored) and never hard-coded in the main sketch.
 
 ---
@@ -402,6 +404,8 @@ Environmental_Stationary_Logger_V1.4/
 │   ├── dashboard.html                          Browser-renderable dashboard preview (dummy data)
 │   ├── graphs.html                             Browser-renderable graphs preview (dummy data)
 │   ├── config.html                             Browser-renderable config page preview
+│   ├── config-v1.4e.html                       Config preview snapshot for v1.4e
+│   ├── backup_2026-10-06/                      Previous mockup versions
 │   ├── dashboard.png                           Dashboard screenshot
 │   ├── graphs.png                              Graphs screenshot
 │   └── config.png                              Config page screenshot
@@ -418,8 +422,14 @@ Environmental_Stationary_Logger_V1.4/
 
 ## Firmware Changelog
 
-### v1.4e — Config page rework
-- Config page: responsive layout, jump-to-section panel, GPIO cards, calibration section
+### v1.4e (2026-10-06) — Security, resilience and UI pass
+- Uploads try HTTPS first, then fall back to plain HTTP (`UPLOAD_ALLOW_HTTP_FALLBACK`); radmon credentials URL-encoded
+- Optional admin login (`SECRET_ADMIN_USER` / `SECRET_ADMIN_PASS`) for `/config`, admin actions and ElegantOTA `/update`
+- WiFi: auto-reconnect and 60 s boot timeout with restart
+- Upload task feeds the watchdog between attempts
+- Admin pages send `X-Frame-Options`; history CSV cached for 30 s
+- uRADMonitor version codes moved to named constants
+- Config page: responsive layout, sticky notes panel and action bar, clearer section headings, jump-to-section panel, GPIO cards, calibration section
 - Per-tube profile cards: preset values as text; Custom exposes dead time, conversion factor and operating voltage min/max (persisted per tube)
 - Delete History CSV moved from `/graphs` to the config page
 - Disabled EXP sensors are hidden on the dashboard and `/graphs` and left empty in the history CSV
