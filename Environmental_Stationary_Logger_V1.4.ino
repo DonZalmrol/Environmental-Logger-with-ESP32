@@ -58,12 +58,13 @@
  *  data.uradmonitor.com — full environmental payload via HTTP POST to
  *                         /api/v1/upload/exp with X-User-id / X-User-hash /
  *                         X-Device-id headers (plain HTTP)
- *  NOTE: Both endpoints currently use plain HTTP (no TLS).  Credentials are
+ *  NOTE: Uploads try HTTPS first and fall back to plain HTTP when
+ *        UPLOAD_ALLOW_HTTP_FALLBACK is 1 (default).  Credentials are
  *        stored in arduino_secrets.h and never hard-coded in this file.
  *
  *  FILES
  *  -----
- *  Environmental_Stationary_Logger_V1.2.ino  — this file
+ *  Environmental_Stationary_Logger_V1.4.ino  — this file
  *  arduino_secrets.h                         — WiFi / API credentials (gitignored)
  *  bsec_iaq.h                                — BSEC binary config (3.3 V, 3s LP, 4d)
  *  src/Digital_Light_TSL2561.h/.cpp          — local TSL2561 driver
@@ -88,6 +89,7 @@
 #include <WiFiUdp.h>
 #include <EEPROM.h>
 #include <ArduinoHttpClient.h>
+#include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
 #include <esp_err.h>
 #include <esp_ota_ops.h>
@@ -129,15 +131,35 @@ const uint8_t bsec_config_iaq[] =
 // Give Radmon a little more time than ArduinoHttpClient's 30 s default.
 #define RADMON_HTTP_TIMEOUT_MS 45000UL
 
+// Uploads try HTTPS first; set to 0 to forbid the plain-HTTP retry when HTTPS fails.
+#ifndef UPLOAD_ALLOW_HTTP_FALLBACK
+#define UPLOAD_ALLOW_HTTP_FALLBACK 1
+#endif
+
 // Let the scheduler and idle task run briefly each loop iteration.
 // PCNT keeps counting pulses in hardware, so a 1 ms cooperative pause is safe here.
 #define LOOP_IDLE_DELAY_MS 1UL
 
-#define FIRMWARE_VERSION "v1.4d"
+#define FIRMWARE_VERSION "v1.4e"
+
+// Numeric version codes reported to uRADMonitor (EXP fields 0E / 0F).
+static const char *const URAD_HARDWARE_VERSION_CODE = "107";
+static const char *const URAD_FIRMWARE_VERSION_CODE = "124";
 
 // Single source of truth for the version history — used verbatim in the
 // web changelog dialog so source and UI are always in sync.
 static const char* const FIRMWARE_CHANGELOG =
+  "v1.4e  (2026-10-06)  Security, resilience and UI pass:\n"
+  "  - Uploads try HTTPS first, then fall back to plain HTTP\n"
+  "    (UPLOAD_ALLOW_HTTP_FALLBACK); radmon credentials URL-encoded.\n"
+  "  - Optional admin login (SECRET_ADMIN_USER/PASS) for /config,\n"
+  "    admin actions and ElegantOTA /update.\n"
+  "  - WiFi: auto-reconnect and 60 s boot timeout with restart.\n"
+  "  - Upload task feeds the watchdog between attempts.\n"
+  "  - Config page: responsive layout, sticky notes panel and\n"
+  "    action bar, clearer section headings.\n"
+  "  - Admin pages send X-Frame-Options; history CSV is cached 30 s.\n"
+  "  - uRADMonitor version codes moved to named constants.\n\n"
   "v1.4d  (2026-04-19)  Dashboard & telemetry expansion:\n"
   "  - Per-tube CPM cards (Tube 1 CPM, Tube 2 CPM) on dashboard.\n"
   "  - Live CPM chart: combined + per-tube CPM.\n"
@@ -281,6 +303,25 @@ struct UploadStatusSnapshot {
   UploadRecord radmon;
   UploadRecord uradmon;
 };
+
+// Optional admin credentials: define SECRET_ADMIN_USER / SECRET_ADMIN_PASS in arduino_secrets.h.
+// When SECRET_ADMIN_PASS is absent, admin pages and OTA stay open (a warning is logged at boot).
+#ifdef SECRET_ADMIN_PASS
+#ifndef SECRET_ADMIN_USER
+#define SECRET_ADMIN_USER "admin"
+#endif
+static const bool ADMIN_AUTH_ENABLED = true;
+#else
+#define SECRET_ADMIN_USER ""
+#define SECRET_ADMIN_PASS ""
+static const bool ADMIN_AUTH_ENABLED = false;
+#endif
+
+// Give up and reboot if WiFi cannot connect within this time at boot.
+#define WIFI_CONNECT_TIMEOUT_MS 60000UL
+
+// Returns false (after sending a 401 challenge) when the request lacks valid admin credentials.
+static bool requireAdminAuth(void);
 
 // Helper functions declarations
 static void WiFiSetup(void);
@@ -560,8 +601,7 @@ int statusCodeURadmon = 0;
 UploadRecord lastURadmonUpload = {};
 portMUX_TYPE uploadStatusMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Set NTP server for Europe (currently unused; ntp.begin() uses pool default)
-//const char *ntpServer = "europe.pool.ntp.org";
+// Set NTP server: configured at runtime via activeNtpServer.
 
 // Create a task handle
 TaskHandle_t uploadTask = NULL;
@@ -645,6 +685,11 @@ void setup()
 
     if (spiffsMounted)
     {
+      // A prune interrupted between remove() and rename() leaves only the temp file
+      if (!SPIFFS.exists(HISTORY_LOG_PATH) && SPIFFS.exists(HISTORY_LOG_TMP_PATH))
+      {
+        SPIFFS.rename(HISTORY_LOG_TMP_PATH, HISTORY_LOG_PATH);
+      }
       historyRowCount = countHistoryRows();
       Serial.println("SPIFFS mounted: free " + String(getFsFreeBytes() / 1024.0f, 1) + " kB / " + String(getFsTotalBytes() / 1024.0f, 1) + " kB, history rows=" + String(historyRowCount));
     }
@@ -963,6 +1008,7 @@ void loop()
     tubeVoltage = displayTubeVoltage();
     epoch = ntp.epoch();
     appendHistorySample(epoch);
+    VERBOSE_SERIAL_PRINTLN(String(F("Heap free/max block: ")) + ESP.getFreeHeap() + "/" + ESP.getMaxAllocHeap());
 
     // Extra WIFI connection check
     if (WiFi.status() != WL_CONNECTED)
@@ -1122,13 +1168,20 @@ static void WiFiSetup(void)
     Serial.println(F("WARNING: Failed to reset WiFi to DHCP mode"));
   }
   
+  WiFi.setAutoReconnect(true);
   WiFi.begin(my_ssid.c_str(), my_password.c_str());
   WiFi.setHostname(my_hostname.c_str());
   
   // Set up Wifi connection
+  const unsigned long wifiStartMs = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
     esp_task_wdt_reset();
+    if ((millis() - wifiStartMs) > WIFI_CONNECT_TIMEOUT_MS)
+    {
+      Serial.println(F("\nWiFi connect timeout; restarting."));
+      ESP.restart();
+    }
     delay(500);
     Serial.print(".");
   }
@@ -1157,6 +1210,14 @@ static void WiFiSetup(void)
   server.on("/history.csv", HTTP_GET, handleHistoryCsvPath);
   server.on("/history-delete", HTTP_POST, handleHistoryDeletePath);
   server.on("/ota-check", handleOtaCheckPath);
+  if (ADMIN_AUTH_ENABLED)
+  {
+    ElegantOTA.setAuth(SECRET_ADMIN_USER, SECRET_ADMIN_PASS);
+  }
+  else
+  {
+    Serial.println(F("WARNING: SECRET_ADMIN_PASS not set; /config, /update and admin actions are unauthenticated."));
+  }
   ElegantOTA.begin(&server);
   server.begin();
   Serial.println(F("Server listening"));
@@ -1345,8 +1406,8 @@ static void loadRuntimeSettings(void)
     activeTubePresetLabel = String(CUSTOM_TUBE_PRESET_LABEL);
     activeTubeDeadTimeSeconds = settingsStore.getFloat("tube_dead", LOGGER_DEFAULT_TUBE_DEAD_TIME_SECONDS);
     activeTubeConversionFactor = settingsStore.getFloat("tube_conv", LOGGER_DEFAULT_TUBE_CONVERSION_FACTOR_USV_PER_CPM);
-    activeTubeOperatingVoltageMin = 0.0f;
-    activeTubeOperatingVoltageMax = 0.0f;
+    activeTubeOperatingVoltageMin = settingsStore.getFloat("tube_vmin", 0.0f);
+    activeTubeOperatingVoltageMax = settingsStore.getFloat("tube_vmax", 0.0f);
     activeTubePresetNote = String("Custom values are saved in NVS; verify the operating voltage range against your tube datasheet.");
 
     if (activeTubeDeadTimeSeconds <= 0.0f)
@@ -1377,8 +1438,8 @@ static void loadRuntimeSettings(void)
     activeTube2PresetLabel = String(CUSTOM_TUBE_PRESET_LABEL);
     activeTube2DeadTimeSeconds = settingsStore.getFloat("tube2_dead", activeTubeDeadTimeSeconds);
     activeTube2ConversionFactor = settingsStore.getFloat("tube2_conv", activeTubeConversionFactor);
-    activeTube2OperatingVoltageMin = 0.0f;
-    activeTube2OperatingVoltageMax = 0.0f;
+    activeTube2OperatingVoltageMin = settingsStore.getFloat("tube2_vmin", 0.0f);
+    activeTube2OperatingVoltageMax = settingsStore.getFloat("tube2_vmax", 0.0f);
     activeTube2PresetNote = String("Custom tube 2 values are saved in NVS; verify against its datasheet.");
     if (activeTube2DeadTimeSeconds <= 0.0f) activeTube2DeadTimeSeconds = activeTubeDeadTimeSeconds;
     if (activeTube2ConversionFactor <= 0.0f) activeTube2ConversionFactor = activeTubeConversionFactor;
@@ -1411,6 +1472,29 @@ static void configureTimeRules(void)
   ntp.ruleSTD("STD", Last, Sun, Oct, 3, activeTimezoneOffsetMinutes);
 }
 
+// Blank min/max means "unknown" (stored as 0); otherwise both must be positive volts with min < max.
+static bool parseTubeVoltageRange(const String &minText, const String &maxText, float &minOut, float &maxOut, const char *tubeLabel, String &notice)
+{
+  minOut = 0.0f;
+  maxOut = 0.0f;
+  if ((minText.length() > 0) && !parseFloatFieldInRange(minText, minOut, 1.0f, 2000.0f))
+  {
+    notice = String(tubeLabel) + " minimum operating voltage must be between 1 and 2000 V.";
+    return false;
+  }
+  if ((maxText.length() > 0) && !parseFloatFieldInRange(maxText, maxOut, 1.0f, 2000.0f))
+  {
+    notice = String(tubeLabel) + " maximum operating voltage must be between 1 and 2000 V.";
+    return false;
+  }
+  if (((minOut > 0.0f) != (maxOut > 0.0f)) || (minOut > maxOut))
+  {
+    notice = String(tubeLabel) + " operating voltage needs both a minimum and a maximum, with minimum below maximum.";
+    return false;
+  }
+  return true;
+}
+
 static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
 {
   String wifiSsid = server.arg("wifi_ssid");
@@ -1427,6 +1511,10 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   String tubeConversionFactorValue = server.arg("tube_conversion_factor");
   String tube2DeadTimeUs = server.hasArg("tube2_dead_time_us") ? server.arg("tube2_dead_time_us") : String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
   String tube2ConversionFactorValue = server.hasArg("tube2_conversion_factor") ? server.arg("tube2_conversion_factor") : String(activeTube2ConversionFactor, 6);
+  String tubeVMinValue = server.arg("tube_vmin");
+  String tubeVMaxValue = server.arg("tube_vmax");
+  String tube2VMinValue = server.hasArg("tube2_vmin") ? server.arg("tube2_vmin") : (activeTube2OperatingVoltageMin > 0.0f ? String(activeTube2OperatingVoltageMin, 0) : String(""));
+  String tube2VMaxValue = server.hasArg("tube2_vmax") ? server.arg("tube2_vmax") : (activeTube2OperatingVoltageMax > 0.0f ? String(activeTube2OperatingVoltageMax, 0) : String(""));
   String timezoneOffsetValue = server.arg("timezone_offset_minutes");
   String dstProfileValue = normalizeDstProfileId(server.arg("dst_profile"));
   String dstOffsetValue = server.arg("dst_offset_minutes");
@@ -1590,6 +1678,10 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   float customConversionFactor = 0.0f;
   float customTube2DeadTimeUs = 0.0f;
   float customTube2ConversionFactor = 0.0f;
+  float customTubeVMin = 0.0f;
+  float customTubeVMax = 0.0f;
+  float customTube2VMin = 0.0f;
+  float customTube2VMax = 0.0f;
   long parsedTimezoneOffset = DEFAULT_TIMEZONE_OFFSET_MINUTES;
   long parsedDstOffset = DEFAULT_DST_OFFSET_MINUTES;
   long parsedHistoryRetentionHours = (long)DEFAULT_HISTORY_RETENTION_HOURS;
@@ -1694,6 +1786,11 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
       noticeClass = "danger";
       return false;
     }
+    if (!parseTubeVoltageRange(tubeVMinValue, tubeVMaxValue, customTubeVMin, customTubeVMax, "Tube 1", notice))
+    {
+      noticeClass = "danger";
+      return false;
+    }
   }
   if (tube2PresetId == CUSTOM_TUBE_PRESET_ID)
   {
@@ -1706,6 +1803,11 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     if (!parsePositiveFloatField(tube2ConversionFactorValue, customTube2ConversionFactor))
     {
       notice = "Custom tube 2 conversion factor must be a positive number in uSv/h per CPM.";
+      noticeClass = "danger";
+      return false;
+    }
+    if (!parseTubeVoltageRange(tube2VMinValue, tube2VMaxValue, customTube2VMin, customTube2VMax, "Tube 2", notice))
+    {
       noticeClass = "danger";
       return false;
     }
@@ -1831,22 +1933,30 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   {
     settingsStore.putFloat("tube_dead", customDeadTimeUs / 1000000.0f);
     settingsStore.putFloat("tube_conv", customConversionFactor);
+    settingsStore.putFloat("tube_vmin", customTubeVMin);
+    settingsStore.putFloat("tube_vmax", customTubeVMax);
   }
   else
   {
     settingsStore.remove("tube_dead");
     settingsStore.remove("tube_conv");
+    settingsStore.remove("tube_vmin");
+    settingsStore.remove("tube_vmax");
   }
   settingsStore.putString("tube2_preset", tube2PresetId);
   if (tube2PresetId == CUSTOM_TUBE_PRESET_ID)
   {
     settingsStore.putFloat("tube2_dead", customTube2DeadTimeUs / 1000000.0f);
     settingsStore.putFloat("tube2_conv", customTube2ConversionFactor);
+    settingsStore.putFloat("tube2_vmin", customTube2VMin);
+    settingsStore.putFloat("tube2_vmax", customTube2VMax);
   }
   else
   {
     settingsStore.remove("tube2_dead");
     settingsStore.remove("tube2_conv");
+    settingsStore.remove("tube2_vmin");
+    settingsStore.remove("tube2_vmax");
   }
   settingsStore.end();
 
@@ -2273,6 +2383,7 @@ static String adminPageShell(const String &title, const String &subtitle, const 
   uint64_t uptimeSeconds = getUptimeSeconds();
   String shell;
 
+  server.sendHeader("X-Frame-Options", "DENY");
   shell.reserve(body.length() + 5900);
   shell += "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   shell += "<link rel='icon' type='image/svg+xml' href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9762;</text></svg>\">";
@@ -2330,6 +2441,17 @@ static String adminPageShell(const String &title, const String &subtitle, const 
            ".badge.text-bg-primary{background:linear-gradient(135deg,var(--accent),var(--accent-strong))!important;color:#fff!important;}"
            "a{color:var(--accent);}"
            "@media (max-width:820px){.hero-grid{grid-template-columns:1fr;}.topbar{padding:10px 12px;}.menu{width:100%;}}"
+           "form .col-12>h3.text-uppercase{margin-top:18px!important;padding-bottom:8px;border-bottom:1px solid var(--border);letter-spacing:.08em;color:var(--accent)!important;}"
+           "form>.col-12:first-child>h3.text-uppercase{margin-top:0!important;}"
+           ".form-text{font-size:.78rem;}.card-body{overflow-wrap:anywhere;}"
+           ".gpio-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;}"
+           ".gpio-card{display:flex;flex-direction:column;justify-content:space-between;gap:10px;padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--bg-soft);min-width:0;}"
+           ".gpio-action{display:flex;align-items:center;justify-content:space-between;gap:8px;}"
+           ".gpio-pin{padding:4px 10px;border:1px solid var(--border);border-radius:999px;background:var(--card);font-size:.82rem;white-space:nowrap;}"
+           ".gpio-action .btn{white-space:nowrap;}"
+           ".cfg-actions{position:sticky;bottom:0;z-index:5;margin-top:18px!important;padding:12px 14px!important;border:1px solid var(--border);border-radius:16px;background:var(--card);box-shadow:0 -8px 24px var(--shadow);}"
+           "@media (min-width:992px){.cfg-notes{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow-y:auto;}}"
+           "@media (max-width:576px){.page-shell{padding:10px 10px 20px;}.hero{padding:16px;border-radius:18px;}.card-body{padding:14px;}.cfg-actions .btn{flex:1 1 100%;}dialog{max-width:94vw!important;}}"
            "</style></head><body>";
   shell += "<main class='page-shell'>";
   shell += "<header class='topbar'><div class='brand'><span class='brand-mark'>&#9762;</span><span>Environmental Logger</span></div><nav class='menu'>";
@@ -2443,6 +2565,7 @@ static void uploadTaskFunction(void * parameter)
 
   // Connect to RadMon.org
   connectToRadMonLogger(snap);
+  esp_task_wdt_reset();
   
   // Connect to Uradmonitor
   connectToURadMonLogger(snap);
@@ -2459,6 +2582,58 @@ static void uploadTaskFunction(void * parameter)
   //vTaskDelete(uploadTask);
   uploadTask = NULL;
   vTaskDelete(NULL);
+}
+
+// POST with empty body; HTTPS first, then plain HTTP if HTTPS could not connect/complete.
+static int postUpload(const char *host, const String &path, const char *userId, const char *userKey, const char *deviceId)
+{
+  for (int attempt = 0; attempt < 2; ++attempt)
+  {
+    bool secure = (attempt == 0);
+    if (!secure && !UPLOAD_ALLOW_HTTP_FALLBACK)
+    {
+      break;
+    }
+
+    esp_task_wdt_reset();
+    WiFiClient plain;
+    WiFiClientSecure tls;
+    // No CA bundle is embedded: traffic is encrypted but the server is not authenticated.
+    tls.setInsecure();
+    Client &transport = secure ? static_cast<Client &>(tls) : static_cast<Client &>(plain);
+    HttpClient client(transport, host, secure ? 443 : 80);
+    client.setHttpResponseTimeout(RADMON_HTTP_TIMEOUT_MS);
+
+    client.beginRequest();
+    client.post(path);
+    if (userId != nullptr)
+    {
+      client.sendHeader("X-User-id", userId);
+      client.sendHeader("X-User-hash", userKey);
+      client.sendHeader("X-Device-id", deviceId);
+    }
+    client.sendHeader("Content-Type", "application/x-www-form-urlencoded");
+    client.sendHeader("Content-Length", 0);
+    client.beginBody();
+    client.endRequest();
+
+    int responseCode = client.responseStatusCode();
+    client.flush();
+    client.stop();
+    yield();
+    esp_task_wdt_reset();
+
+    if (responseCode > 0)
+    {
+      return responseCode;
+    }
+    VERBOSE_SERIAL_PRINTLN(secure ? F("HTTPS upload failed; trying plain HTTP.") : F("HTTP upload failed."));
+    if (!secure)
+    {
+      return responseCode;
+    }
+  }
+  return HTTP_ERROR_CONNECTION_FAILED;
 }
 
 // Upload data to the RadMon.org server
@@ -2487,49 +2662,26 @@ static void connectToRadMonLogger(UploadSnapshot *snap)
     return;
   }
 
-  WiFiClient wifi;
-  HttpClient client = HttpClient(wifi, "radmon.org", 80);
-  client.setHttpResponseTimeout(RADMON_HTTP_TIMEOUT_MS);
-
-  VERBOSE_SERIAL_PRINTLN(F("Connection to radmon monitoring platform succeeded!"));
 
   // Concat data for POST
   // API URL
   String ptr = "/radmon.php?function=submit";
   ptr += "&user=";
-  ptr += UserName;
+  ptr += urlEncode(UserName);
   ptr += "&password=";
-  ptr += DataSendingPassWord;
+  ptr += urlEncode(DataSendingPassWord);
   ptr += "&value=";
   ptr += String(snap->cpm);
   ptr += "&unit=CPM";
   //ptr += "&datetime=";
   //ptr += String(epoch);
 
-  // Test output
-  VERBOSE_SERIAL_PRINTLN("created PTR = " + ptr);
-
-  client.beginRequest();
-  client.post(ptr);
-  client.sendHeader("Content-Type", "application/x-www-form-urlencoded");
-  client.sendHeader("Content-Length", 0);  // body is empty; ptr is the URL path, not the body
-  client.beginBody();
-  client.print("");
-  client.endRequest();
-
-  // read the status code and body of the response
-  int responseCode = client.responseStatusCode();
+  int responseCode = postUpload("radmon.org", ptr, nullptr, nullptr, nullptr);
 
   portENTER_CRITICAL(&uploadStatusMux);
   statusCodeRadmon = responseCode;
   lastRadmonUpload = currentUpload;
   portEXIT_CRITICAL(&uploadStatusMux);
-
-  // Added on 2024-05-11 as a test to clean up the connection
-  client.flush();
-
-  // Give the client some time to stop
-  yield();
 
   VERBOSE_SERIAL_PRINTLN(F("Connection to radmon monitoring platform Disconnected."));
   VERBOSE_SERIAL_PRINTLN("Status Code Radmon = " + String(responseCode));
@@ -2564,11 +2716,6 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
     return;
   }
 
-  WiFiClient wifi;
-  HttpClient client = HttpClient(wifi, "data.uradmonitor.com", 80);
-
-  VERBOSE_SERIAL_PRINTLN(F("Connection to uradmonitoring platform succeeded!"));
-  
   /** Concat data for POST
   * API URL based on the expProtocol.h
   * https://github.com/radhoo/uradmonitor_kit1/blob/master/code/misc/expProtocol.h
@@ -2652,13 +2799,13 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HARDWARE_VERSION))
   {
     ptr += "/0E/";
-    ptr += "107";
+    ptr += URAD_HARDWARE_VERSION_CODE;
   }
 
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_FIRMWARE_VERSION))
   {
     ptr += "/0F/";
-    ptr += "124";
+    ptr += URAD_FIRMWARE_VERSION_CODE;
   }
 
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TUBE_TYPE))
@@ -2702,30 +2849,12 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
   // Test output
   VERBOSE_SERIAL_PRINTLN("created EXP code = " + ptr);
 
-  client.beginRequest();
-  client.post(ptr);
-  client.sendHeader("X-User-id", USER_ID.c_str());
-  client.sendHeader("X-User-hash", USER_KEY.c_str());
-  client.sendHeader("X-Device-id", DEVICE_ID.c_str());
-  client.sendHeader("Content-Type", "application/x-www-form-urlencoded");
-  client.sendHeader("Content-Length", 0);  // body is empty; ptr is the URL path, not the body
-  client.beginBody();
-  client.print("");
-  client.endRequest();
-
-  // read the status code and body of the response
-  int responseCode = client.responseStatusCode();
+  int responseCode = postUpload("data.uradmonitor.com", ptr, USER_ID.c_str(), USER_KEY.c_str(), DEVICE_ID.c_str());
 
   portENTER_CRITICAL(&uploadStatusMux);
   statusCodeURadmon = responseCode;
   lastURadmonUpload = currentUpload;
   portEXIT_CRITICAL(&uploadStatusMux);
-
-  // Added on 2024-05-11 as a test to clean up the connection
-  client.flush();
-
-  // Give the client some time to stop
-  yield();
 
   VERBOSE_SERIAL_PRINTLN(F("Connection to uradmonitoring platform Disconnected."));
   VERBOSE_SERIAL_PRINTLN("Status Code URadmon = " + String(responseCode));
@@ -3106,8 +3235,68 @@ void handleJsonPath()
   server.send(200, "application/json", JsonPage());
 }
 
+// JSON map of which EXP-controlled readings are enabled; used by the dashboard and graphs to hide disabled ones.
+static String buildExpEnabledJson()
+{
+  auto flag = [](const char *key, uint32_t sensorFlag, bool last) {
+    return String("\"") + key + "\":" + (isExpSensorEnabled(activeExpSensorMask, sensorFlag) ? "true" : "false") + (last ? "" : ",");
+  };
+  String json = "{";
+  json += flag("temp", EXP_SENSOR_TEMPERATURE, false);
+  json += flag("humidity", EXP_SENSOR_HUMIDITY, false);
+  json += flag("pressure", EXP_SENSOR_PRESSURE, false);
+  json += flag("illuminance", EXP_SENSOR_ILLUMINANCE, false);
+  json += flag("voc", EXP_SENSOR_VOC, false);
+  json += flag("co2", EXP_SENSOR_CO2, false);
+  json += flag("ch2o", EXP_SENSOR_CH2O, false);
+  json += flag("pm1", EXP_SENSOR_PM1, false);
+  json += flag("pm25", EXP_SENSOR_PM25, false);
+  json += flag("pm10", EXP_SENSOR_PM10, false);
+  json += flag("cpm", EXP_SENSOR_CPM, false);
+  json += flag("hv", EXP_SENSOR_HV, false);
+  json += flag("hvduty", EXP_SENSOR_HV_DUTY, false);
+  json += String("\"tube2\":") + (activeDualTubeEnabled ? "true" : "false");
+  json += "}";
+  return json;
+}
+
+// Renders one "Active tube profile" card. Presets show dead time, conversion factor and operating range as text;
+// the Custom preset swaps that text for editable inputs (dead time, conversion factor, min/max voltage).
+static String buildTubeProfileCardHtml(const String &p, const String &title, const String &label, const String &expCode, const String &voltageRange, const String &note, const String &deadUs, const String &conv, const String &vMin, const String &vMax, bool custom, bool enabled, const String &extraNote)
+{
+  String dis = enabled ? "" : " disabled";
+  String h = "<div class='col-12 col-lg-6'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-1'>" + title + "</div>";
+  h += "<div class='hint'>Current runtime selection: <span class='mono' id='" + p + "ProfileName'>" + htmlEscape(label) + "</span><br>EXP tube code: <span class='mono' id='" + p + "ExpCode'>" + expCode + "</span>";
+  h += "<div id='" + p + "PresetFacts'" + String(custom ? " style='display:none'" : "") + ">Dead time: <span class='mono' id='" + p + "DeadText'>" + htmlEscape(deadUs) + " us</span><br>Conversion factor: <span class='mono' id='" + p + "ConvText'>" + htmlEscape(conv) + " uSv/h per CPM</span><br>Operating range: <span class='mono' id='" + p + "VoltageRange'>" + htmlEscape(voltageRange) + "</span></div>";
+  h += "<span id='" + p + "ProfileNote'>" + htmlEscape(note) + "</span>";
+  if (extraNote.length() > 0)
+  {
+    h += "<br>" + extraNote;
+  }
+  h += "</div>";
+  h += "<div class='row g-3 mt-1' id='" + p + "CustomFields'" + String(custom ? "" : " style='display:none'") + ">";
+  h += "<div class='col-sm-6'><label class='form-label' for='" + p + "_dead_time_us'>Dead Time (us)</label><input class='form-control mono' id='" + p + "_dead_time_us' name='" + p + "_dead_time_us' value='" + htmlEscape(deadUs) + "'" + String(custom ? "" : " readonly") + dis + "></div>";
+  h += "<div class='col-sm-6'><label class='form-label' for='" + p + "_conversion_factor'>Conversion Factor (uSv/h per CPM)</label><input class='form-control mono' id='" + p + "_conversion_factor' name='" + p + "_conversion_factor' value='" + htmlEscape(conv) + "'" + String(custom ? "" : " readonly") + dis + "></div>";
+  h += "<div class='col-sm-6'><label class='form-label' for='" + p + "_vmin'>Operating Voltage Min (V)</label><input class='form-control mono' id='" + p + "_vmin' name='" + p + "_vmin' inputmode='decimal' value='" + htmlEscape(vMin) + "'" + dis + "></div>";
+  h += "<div class='col-sm-6'><label class='form-label' for='" + p + "_vmax'>Operating Voltage Max (V)</label><input class='form-control mono' id='" + p + "_vmax' name='" + p + "_vmax' inputmode='decimal' value='" + htmlEscape(vMax) + "'" + dis + "></div>";
+  h += "</div><div class='form-text mt-2' id='" + p + "CalibrationHint'>Preset values are fixed. Choose Custom to enter your own; min/max voltage may be left blank.</div></div></div>";
+  return h;
+}
+
+static bool requireAdminAuth(void)
+{
+  if (!ADMIN_AUTH_ENABLED || server.authenticate(SECRET_ADMIN_USER, SECRET_ADMIN_PASS))
+  {
+    return true;
+  }
+  server.requestAuthentication();
+  return false;
+}
+
 void handleConfigPath()
 {
+  if (!requireAdminAuth()) return;
+
   String notice;
   String noticeClass = "success";
   bool wifiPasswordStored = (my_password.length() > 0);
@@ -3123,6 +3312,10 @@ void handleConfigPath()
   String displayedTubeConversionFactor = String(activeTubeConversionFactor, 6);
   String displayedTube2DeadTimeUs = String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
   String displayedTube2ConversionFactor = String(activeTube2ConversionFactor, 6);
+  String displayedTubeVMin = activeTubeOperatingVoltageMin > 0.0f ? String(activeTubeOperatingVoltageMin, 0) : String("");
+  String displayedTubeVMax = activeTubeOperatingVoltageMax > 0.0f ? String(activeTubeOperatingVoltageMax, 0) : String("");
+  String displayedTube2VMin = activeTube2OperatingVoltageMin > 0.0f ? String(activeTube2OperatingVoltageMin, 0) : String("");
+  String displayedTube2VMax = activeTube2OperatingVoltageMax > 0.0f ? String(activeTube2OperatingVoltageMax, 0) : String("");
   String displayedTubeVoltageRange = formatOperatingVoltageRange(activeTubeOperatingVoltageMin, activeTubeOperatingVoltageMax);
   String displayedTube2VoltageRange = formatOperatingVoltageRange(activeTube2OperatingVoltageMin, activeTube2OperatingVoltageMax);
   String displayedTubeNote = activeTubePresetNote;
@@ -3161,6 +3354,10 @@ void handleConfigPath()
     displayedTubeConversionFactor = server.arg("tube_conversion_factor");
     displayedTube2DeadTimeUs = server.hasArg("tube2_dead_time_us") ? server.arg("tube2_dead_time_us") : String(activeTube2DeadTimeSeconds * 1000000.0f, 3);
     displayedTube2ConversionFactor = server.hasArg("tube2_conversion_factor") ? server.arg("tube2_conversion_factor") : String(activeTube2ConversionFactor, 6);
+    displayedTubeVMin = server.arg("tube_vmin");
+    displayedTubeVMax = server.arg("tube_vmax");
+    displayedTube2VMin = server.hasArg("tube2_vmin") ? server.arg("tube2_vmin") : displayedTube2VMin;
+    displayedTube2VMax = server.hasArg("tube2_vmax") ? server.arg("tube2_vmax") : displayedTube2VMax;
     displayedTimezoneOffset = server.arg("timezone_offset_minutes");
     displayedDstProfile = normalizeDstProfileId(server.arg("dst_profile"));
     displayedDstOffset = server.arg("dst_offset_minutes");
@@ -3228,6 +3425,10 @@ void handleConfigPath()
       displayedTube2ConversionFactor = String(activeTube2ConversionFactor, 6);
       displayedTubeVoltageRange = formatOperatingVoltageRange(activeTubeOperatingVoltageMin, activeTubeOperatingVoltageMax);
       displayedTube2VoltageRange = formatOperatingVoltageRange(activeTube2OperatingVoltageMin, activeTube2OperatingVoltageMax);
+      displayedTubeVMin = activeTubeOperatingVoltageMin > 0.0f ? String(activeTubeOperatingVoltageMin, 0) : String("");
+      displayedTubeVMax = activeTubeOperatingVoltageMax > 0.0f ? String(activeTubeOperatingVoltageMax, 0) : String("");
+      displayedTube2VMin = activeTube2OperatingVoltageMin > 0.0f ? String(activeTube2OperatingVoltageMin, 0) : String("");
+      displayedTube2VMax = activeTube2OperatingVoltageMax > 0.0f ? String(activeTube2OperatingVoltageMax, 0) : String("");
       displayedTubeNote = activeTubePresetNote;
       displayedTube2Note = activeTube2PresetNote;
       displayedTimezoneOffset = String(activeTimezoneOffsetMinutes);
@@ -3256,7 +3457,7 @@ void handleConfigPath()
   }
 
   body += "<div class='row g-4'>";
-  body += "<div class='col-12 col-xl-9'><div class='card'><div class='card-body'>";
+  body += "<div class='col-12 col-lg-8 col-xl-9'><div class='card'><div class='card-body'>";
   body += "<h2 class='h5 mb-3'>Runtime Configuration</h2>";
   body += "<p class='hint mb-4'>Values saved here override the compiled defaults. Text fields fall back to <span class='mono'>arduino_secrets.h</span> when left blank, numeric fields fall back to their compiled firmware defaults when cleared, and secret fields stay unchanged unless you enter a replacement or tick their reset box.</p>";
   body += "<form method='post' action='/config' class='row g-3'>";
@@ -3290,26 +3491,28 @@ void handleConfigPath()
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Diagnostics</h3></div>";
   body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='serial_verbose' name='serial_verbose'" + String(serialVerboseChecked ? " checked" : "") + "><label class='form-check-label' for='serial_verbose'>Verbose serial logging</label><div class='form-text'>When ON: per-second CPS readings, 61-second sensor dumps, and upload traces are printed to the serial port. When OFF: only warnings and errors are printed.</div></div></div>";
 
-  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Calibration and Logging</h3></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='hv_calibration_factor'>Tube HV Calibration</label><input class='form-control mono' id='hv_calibration_factor' name='hv_calibration_factor' value='" + htmlEscape(displayedHvCalibrationFactor) + "'><div class='form-text'>ADC-to-HV multiplier used by the tube voltage display.</div></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='hcho_r0'>HCHO R0</label><input class='form-control mono' id='hcho_r0' name='hcho_r0' value='" + htmlEscape(displayedHchoR0) + "'><div class='form-text'>Sensor calibration value used by the Grove HCHO conversion formula.</div></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='history_retention_hours'>Historic Storage (hours)</label><input class='form-control mono' id='history_retention_hours' name='history_retention_hours' value='" + htmlEscape(displayedHistoryRetentionHours) + "'><div class='form-text'>Approximate Graphs history retained on SPIFFS. Default is 1 hour.</div><div class='alert alert-warning mt-2 mb-0'>Increasing historic storage beyond 24 hours can fill the entire SPIFFS partition on this build.</div></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='cpm_gauge_full_scale'>CPM Gauge Full-Scale</label><input class='form-control mono' id='cpm_gauge_full_scale' name='cpm_gauge_full_scale' value='" + htmlEscape(displayedCpmGaugeFullScale) + "'><div class='form-text'>CPM at which the radiation gauge reads 100%. Match to your tube type. Default: 600 CPM.</div></div>";
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Logging and Display</h3></div>";
+  body += "<div class='col-md-6'><label class='form-label' for='history_retention_hours'>Historic Storage (hours)</label><input class='form-control mono' id='history_retention_hours' name='history_retention_hours' value='" + htmlEscape(displayedHistoryRetentionHours) + "'><div class='form-text'>Approximate Graphs history retained on SPIFFS. Default is 1 hour.</div><div class='alert alert-warning mt-2 mb-0'>Increasing historic storage beyond 24 hours can fill the entire SPIFFS partition on this build.</div></div>";
+  body += "<div class='col-md-6'><label class='form-label' for='cpm_gauge_full_scale'>CPM Gauge Full-Scale</label><input class='form-control mono' id='cpm_gauge_full_scale' name='cpm_gauge_full_scale' value='" + htmlEscape(displayedCpmGaugeFullScale) + "'><div class='form-text'>CPM at which the radiation gauge reads 100%. Match to your tube type. Default: 600 CPM.</div></div>";
+  body += "<div class='col-12'><div class='d-flex flex-wrap align-items-center gap-2'><a class='btn btn-outline-secondary' href='/history.csv'>Download History CSV</a><button type='submit' class='btn btn-outline-danger' formaction='/history-delete' formmethod='post' formnovalidate onclick=\"return confirm('Delete the retained history CSV from SPIFFS? Unsaved changes on this page are not applied.');\">Delete History CSV</button><span class='form-text'>Clears the retained Graphs history stored on SPIFFS.</span></div></div>";
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Radiation Tube Profiles</h3></div>";
   body += "<div class='col-12'><h4 class='h6 mb-0'>Tube 1</h4></div>";
   body += "<div class='col-md-6'><label class='form-label' for='tube_preset'>Tube 1 Type</label><select class='form-select' id='tube_preset' name='tube_preset'>" + buildTubePresetOptionsHtml(displayedTubePresetId) + "</select><div class='form-text'>EXP field 10 supports one tube ID and reports Tube 1. The selected type and calibration apply to Tube 1.</div></div>";
-  body += "<div class='col-12 col-lg-6'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-1'>Active tube profile</div><div class='hint'>Current runtime selection: <span class='mono' id='tubeProfileName'>" + htmlEscape(activeTubePresetLabel) + "</span><br>EXP tube code: <span class='mono' id='tubeExpCode'>" + formatExpTubeTypeCode(getUradTubeTypeId(displayedTubePresetId)) + "</span><br>Operating range: <span class='mono' id='tubeVoltageRange'>" + htmlEscape(displayedTubeVoltageRange) + "</span><br><span id='tubeProfileNote'>" + htmlEscape(displayedTubeNote) + "</span></div><div class='row g-3 mt-2'><div class='col-sm-6'><label class='form-label' for='tube_dead_time_us'>Dead Time (us)</label><input class='form-control mono' id='tube_dead_time_us' name='tube_dead_time_us' value='" + htmlEscape(displayedTubeDeadTimeUs) + "'" + String(displayedTubePresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + "><div class='form-text'>Dead-time correction for Tube 1.</div></div><div class='col-sm-6'><label class='form-label' for='tube_conversion_factor'>Conversion Factor</label><input class='form-control mono' id='tube_conversion_factor' name='tube_conversion_factor' value='" + htmlEscape(displayedTubeConversionFactor) + "'" + String(displayedTubePresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + "><div class='form-text'>Dose in uSv/h per CPM.</div></div></div><div class='form-text mt-2' id='tubeCalibrationHint'>Preset calibration is fixed. Choose Custom to edit.</div></div></div>";
+  body += buildTubeProfileCardHtml("tube", "Active tube profile", activeTubePresetLabel, formatExpTubeTypeCode(getUradTubeTypeId(displayedTubePresetId)), displayedTubeVoltageRange, displayedTubeNote, displayedTubeDeadTimeUs, displayedTubeConversionFactor, displayedTubeVMin, displayedTubeVMax, displayedTubePresetId == CUSTOM_TUBE_PRESET_ID, true, "");
   body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='dual_tube_enabled' name='dual_tube_enabled'" + String(activeDualTubeEnabled ? " checked" : "") + "><label class='form-check-label' for='dual_tube_enabled'>Enable second GM tube</label><div class='form-text'>When off, Tube 2 profile controls, pulse counting, and dashboard readings are hidden.</div></div></div>";
   body += "<div class='col-12' id='tube2ProfileSection'" + String(activeDualTubeEnabled ? "" : " style='display:none'") + "><div class='row g-3'><div class='col-12'><h4 class='h6 mb-0'>Tube 2</h4></div>";
   body += "<div class='col-md-6'><label class='form-label' for='tube2_preset'>Tube 2 Type</label><select class='form-select' id='tube2_preset' name='tube2_preset'" + String(activeDualTubeEnabled ? "" : " disabled") + ">" + buildTubePresetOptionsHtml(displayedTube2PresetId) + "</select><div class='form-text'>Tube 2 uses its own dead time and dose conversion. EXP field 10 still reports Tube 1.</div></div>";
-  body += "<div class='col-12 col-lg-6'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-1'>Active Tube 2 profile</div><div class='hint'>Current runtime selection: <span class='mono' id='tube2ProfileName'>" + htmlEscape(activeTube2PresetLabel) + "</span><br>EXP tube code: <span class='mono' id='tube2ExpCode'>" + formatExpTubeTypeCode(getUradTubeTypeId(displayedTube2PresetId)) + "</span><br>Operating range: <span class='mono' id='tube2VoltageRange'>" + htmlEscape(displayedTube2VoltageRange) + "</span><br><span id='tube2ProfileNote'>" + htmlEscape(displayedTube2Note) + "</span><br>EXP field 10 reports Tube 1 only.</div><div class='row g-3 mt-2'><div class='col-sm-6'><label class='form-label' for='tube2_dead_time_us'>Dead Time (us)</label><input class='form-control mono' id='tube2_dead_time_us' name='tube2_dead_time_us' value='" + htmlEscape(displayedTube2DeadTimeUs) + "'" + String(displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + String(activeDualTubeEnabled ? "" : " disabled") + "><div class='form-text'>Dead-time correction for Tube 2.</div></div><div class='col-sm-6'><label class='form-label' for='tube2_conversion_factor'>Conversion Factor</label><input class='form-control mono' id='tube2_conversion_factor' name='tube2_conversion_factor' value='" + htmlEscape(displayedTube2ConversionFactor) + "'" + String(displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID ? "" : " readonly") + String(activeDualTubeEnabled ? "" : " disabled") + "><div class='form-text'>Dose in uSv/h per CPM.</div></div></div><div class='form-text mt-2' id='tube2CalibrationHint'>Preset calibration is fixed. Choose Custom to edit.</div></div></div></div></div>";
+  body += buildTubeProfileCardHtml("tube2", "Active Tube 2 profile", activeTube2PresetLabel, formatExpTubeTypeCode(getUradTubeTypeId(displayedTube2PresetId)), displayedTube2VoltageRange, displayedTube2Note, displayedTube2DeadTimeUs, displayedTube2ConversionFactor, displayedTube2VMin, displayedTube2VMax, displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID, activeDualTubeEnabled, "EXP field 10 reports Tube 1 only.");
+  body += "</div></div>";
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>ESP32 Wrover-E GPIO Mapping</h3></div>";
   String sharedI2cSummary = "GPIO" + String(activeI2cSdaPin) + " / GPIO" + String(activeI2cSclPin);
-  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Shared I2C bus</div><div class='form-text'>BME680, HM3301, and TSL2561</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='i2c'>Configure <span class='mono' id='pinSummary_i2c' data-pin-summary='i2c'>" + htmlEscape(sharedI2cSummary) + "</span></button></div></div>";
-  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Tube high-voltage ADC</div><div class='form-text'>Used by Tube Voltage and HV Duty EXP fields</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='hv_adc_pin'>Configure <span class='mono' id='pinSummary_hv_adc_pin' data-pin-summary='hv_adc_pin'>GPIO" + String(activeHvAdcPin) + "</span></button></div></div>";
-  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>HCHO analog input</div><div class='form-text'>CH2O EXP field (08); calibration remains in HCHO R0</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='hcho_adc_pin'>Configure <span class='mono' id='pinSummary_hcho_adc_pin' data-pin-summary='hcho_adc_pin'>GPIO" + String(activeHchoAdcPin) + "</span></button></div></div>";
-  body += "<div class='col-md-6'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Tube 1 pulse input</div><div class='form-text'>Used by Tube 1 CPM</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='tube1_pin'>Configure <span class='mono' id='pinSummary_tube1_pin' data-pin-summary='tube1_pin'>GPIO" + String(activeTube1PulsePin) + "</span></button></div></div>";
-  body += "<div class='col-md-6' id='tube2PinConfigRow'><div class='d-flex align-items-center justify-content-between gap-2'><div><div class='fw-semibold'>Tube 2 pulse input</div><div class='form-text'>Tube 2 radiation counter input</div></div><button type='button' class='btn btn-sm btn-outline-secondary' data-pin-setup='tube2_pin'>Configure <span class='mono' id='pinSummary_tube2_pin' data-pin-summary='tube2_pin'>GPIO" + String(activeTube2PulsePin) + "</span></button></div></div>";
+  body += "<div class='col-12'><div class='gpio-grid'>";
+  body += "<div class='gpio-card'><div class='gpio-info'><div class='fw-semibold'>Shared I2C bus</div><div class='form-text'>BME680, HM3301 and TSL2561 (SDA / SCL)</div></div><div class='gpio-action'><span class='gpio-pin mono' id='pinSummary_i2c' data-pin-summary='i2c'>" + htmlEscape(sharedI2cSummary) + "</span><button type='button' class='btn btn-sm btn-outline-primary' data-pin-setup='i2c'>Change</button></div></div>";
+  body += "<div class='gpio-card'><div class='gpio-info'><div class='fw-semibold'>Tube high-voltage ADC</div><div class='form-text'>Tube Voltage and HV Duty EXP fields</div></div><div class='gpio-action'><span class='gpio-pin mono' id='pinSummary_hv_adc_pin' data-pin-summary='hv_adc_pin'>GPIO" + String(activeHvAdcPin) + "</span><button type='button' class='btn btn-sm btn-outline-primary' data-pin-setup='hv_adc_pin'>Change</button></div></div>";
+  body += "<div class='gpio-card'><div class='gpio-info'><div class='fw-semibold'>HCHO analog input</div><div class='form-text'>CH2O EXP field (08)</div></div><div class='gpio-action'><span class='gpio-pin mono' id='pinSummary_hcho_adc_pin' data-pin-summary='hcho_adc_pin'>GPIO" + String(activeHchoAdcPin) + "</span><button type='button' class='btn btn-sm btn-outline-primary' data-pin-setup='hcho_adc_pin'>Change</button></div></div>";
+  body += "<div class='gpio-card'><div class='gpio-info'><div class='fw-semibold'>Tube 1 pulse input</div><div class='form-text'>Used by Tube 1 CPM</div></div><div class='gpio-action'><span class='gpio-pin mono' id='pinSummary_tube1_pin' data-pin-summary='tube1_pin'>GPIO" + String(activeTube1PulsePin) + "</span><button type='button' class='btn btn-sm btn-outline-primary' data-pin-setup='tube1_pin'>Change</button></div></div>";
+  body += "<div class='gpio-card' id='tube2PinConfigRow'><div class='gpio-info'><div class='fw-semibold'>Tube 2 pulse input</div><div class='form-text'>Tube 2 radiation counter</div></div><div class='gpio-action'><span class='gpio-pin mono' id='pinSummary_tube2_pin' data-pin-summary='tube2_pin'>GPIO" + String(activeTube2PulsePin) + "</span><button type='button' class='btn btn-sm btn-outline-primary' data-pin-setup='tube2_pin'>Change</button></div></div>";
+  body += "</div></div>";
   body += "<div style='display:none'>";
   body += "<select id='i2c_sda_pin' name='i2c_sda_pin'>" + buildEsp32PinOptionsHtml(displayedI2cSdaPin, (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select>";
   body += "<select id='i2c_scl_pin' name='i2c_scl_pin'>" + buildEsp32PinOptionsHtml(displayedI2cSclPin, (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select>";
@@ -3367,7 +3570,13 @@ void handleConfigPath()
   body += "<div class='row g-3 mt-1'><div class='col-6'><label class='form-label' for='expSensorScale'>Scale</label><input class='form-control mono' id='expSensorScale' type='number' min='0.000001' step='any' value='1'></div><div class='col-6'><label class='form-label' for='expSensorOffset'>Offset</label><input class='form-control mono' id='expSensorOffset' type='number' step='any' value='0'></div></div>";
   body += "<div class='d-flex justify-content-between gap-2 mt-4'><button type='button' class='btn btn-outline-secondary' id='expSensorClear'>Clear profile</button><div class='d-flex gap-2'><button type='button' class='btn btn-outline-secondary' id='expSensorCancel'>Cancel</button><button type='button' class='btn btn-primary' id='expSensorApply'>Use profile</button></div></div></dialog>";
 
-  body += "<div class='col-12 d-flex flex-wrap gap-2 pt-2'><button type='submit' class='btn btn-primary'>Save Settings</button><button type='submit' formaction='/reboot' formmethod='post' class='btn btn-warning'>Save and Reboot</button><button type='submit' formaction='/restart' formmethod='post' class='btn btn-outline-secondary'>Reboot Only</button><a class='btn btn-outline-secondary' href='/ota-check'>Review OTA Status</a><a class='btn btn-outline-secondary' href='/update'>Open OTA Update</a></div>";
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Calibration</h3></div>";
+  body += "<div class='col-12'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='row g-3'>";
+  body += "<div class='col-12 col-md-6'><label class='form-label' for='hv_calibration_factor'>Tube HV Calibration</label><input class='form-control mono' id='hv_calibration_factor' name='hv_calibration_factor' value='" + htmlEscape(displayedHvCalibrationFactor) + "'><div class='form-text'>ADC-to-HV multiplier used by the tube voltage display.</div></div>";
+  body += "<div class='col-12 col-md-6'><label class='form-label' for='hcho_r0'>HCHO R0</label><input class='form-control mono' id='hcho_r0' name='hcho_r0' value='" + htmlEscape(displayedHchoR0) + "'><div class='form-text'>Sensor calibration value used by the Grove HCHO conversion formula.</div></div>";
+  body += "</div></div></div>";
+
+  body += "<div class='col-12 d-flex flex-wrap gap-2 pt-2 cfg-actions'><button type='submit' class='btn btn-primary'>Save Settings</button><button type='submit' formaction='/reboot' formmethod='post' class='btn btn-warning'>Save and Reboot</button><button type='submit' formaction='/restart' formmethod='post' class='btn btn-outline-secondary'>Reboot Only</button><a class='btn btn-outline-secondary' href='/ota-check'>Review OTA Status</a><a class='btn btn-outline-secondary' href='/update'>Open OTA Update</a></div>";
   body += "<dialog id='hardwarePinSetupDialog' style='background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:560px;width:92vw;color:var(--text);'><h3 class='h5' id='hardwarePinSetupTitle'>Configure sensor pins</h3><p class='hint' id='hardwarePinSetupHelp'></p>";
   body += "<div id='hardwareI2cRows'><div class='mb-3'><label class='form-label' for='hardwarePinSda'>SDA</label><select class='form-select' id='hardwarePinSda'><option value=''>Select SDA GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select></div><div><label class='form-label' for='hardwarePinScl'>SCL</label><select class='form-select' id='hardwarePinScl'><option value=''>Select SCL GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33}, 12, false) + "</select></div></div>";
   body += "<div id='hardwareAnalogRow'><label class='form-label' for='hardwareAnalogPin'>ADC1 GPIO</label><select class='form-select' id='hardwareAnalogPin'><option value=''>Select ADC1 GPIO</option>" + buildEsp32PinOptionsHtml("", (const int[]){32, 33, 34, 35, 36, 39}, 6, true) + "</select></div>";
@@ -3375,7 +3584,9 @@ void handleConfigPath()
   body += "<div class='d-flex justify-content-end gap-2 mt-4'><button type='button' class='btn btn-outline-secondary' id='hardwarePinCancel'>Cancel</button><button type='button' class='btn btn-primary' id='hardwarePinApply'>Apply pins</button></div></dialog>";
   body += "</form></div></div></div>";
 
-  body += "<div class='col-12 col-xl-3'><div class='card h-100'><div class='card-body'>";
+  body += "<div class='col-12 col-lg-4 col-xl-3'><div class='card cfg-notes'><div class='card-body'>";
+  body += "<h2 class='h6 text-uppercase text-body-secondary mb-2'>Jump to section</h2><div class='d-flex flex-wrap gap-1 mb-3' id='cfgNav'></div><hr>";
+  body += "<script>(function(){var nav=document.getElementById('cfgNav');if(!nav){return;}document.querySelectorAll('h3.text-uppercase').forEach(function(h,i){var id='cfgSec'+i;h.id=id;h.style.scrollMarginTop='16px';var a=document.createElement('a');a.href='#'+id;a.className='btn btn-sm btn-outline-secondary';a.textContent=h.textContent.replace('ESP32 Wrover-E ','');nav.appendChild(a);});})();</script>";
   body += "<h2 class='h5 mb-3'>Setup Notes</h2>";
   body += "<h3 class='h6'>I2C discovery</h3><p class='hint'>The bus is scanned automatically at boot using the selected SDA/SCL pins. Known addresses are labeled BME680 (0x76/0x77), HM3301 (0x40), and TSL2561 (0x29/0x39/0x49); other responding addresses are listed as unidentified. Reboot after changing bus pins.</p>";
   body += "<h3 class='h6'>Sensor pins</h3><p class='hint'>Use Configure beside a sensor to select its GPIO. Analog sensors use <span class='mono'>volts x scale + offset</span>; use the module datasheet to calculate scale/offset. Do not feed more than 3.3 V to an ESP32 input.</p><p class='hint'>Pulse sensors count falling edges. Use a compatible pulse/collector output and set scale to the sensor's units per pulse or per pulse/second. Save and reboot after pin changes.</p>";
@@ -3389,6 +3600,7 @@ void handleConfigPath()
 
   body += "<script>(function(){function byId(id){return document.getElementById(id);}var dialog=byId('expSensorSetupDialog');var analogRow=byId('expSensorAnalogPinRow');var pulseRow=byId('expSensorPulsePinRow');var analogPin=byId('expSensorAnalogPin');var pulsePin=byId('expSensorPulsePin');var scaleInput=byId('expSensorScale');var offsetInput=byId('expSensorOffset');var help=byId('expSensorSetupHelp');var title=byId('expSensorSetupTitle');var activeKey='';var activeMode='';function syncSensor(key){var pin=byId('exp_'+key+'_pin');var scale=byId('exp_'+key+'_scale');var offset=byId('exp_'+key+'_offset');var checkbox=byId('exp_sensor_'+key);var status=byId('exp_'+key+'_status');var scaleValue=Number(scale.value);var offsetValue=Number(offset.value);var ready=Boolean(pin.value)&&Number.isFinite(scaleValue)&&scaleValue>0&&Number.isFinite(offsetValue);checkbox.disabled=!ready;if(!ready){checkbox.checked=false;}status.textContent=ready?'GPIO'+pin.value+' | scale '+scaleValue+' | offset '+offsetValue:'Pin and calibration not configured';}document.querySelectorAll('[data-exp-setup]').forEach(function(button){button.addEventListener('click',function(){activeKey=button.getAttribute('data-exp-setup');activeMode=button.getAttribute('data-exp-mode');title.textContent=button.getAttribute('data-exp-label')+' setup';var currentPin=byId('exp_'+activeKey+'_pin').value;if(activeMode==='analog'){analogRow.style.display='';pulseRow.style.display='none';analogPin.value=currentPin;}else{analogRow.style.display='none';pulseRow.style.display='';pulsePin.value=currentPin;}scaleInput.value=byId('exp_'+activeKey+'_scale').value||'1';offsetInput.value=byId('exp_'+activeKey+'_offset').value||'0';help.textContent=activeMode==='analog'?'Formula: value = ADC voltage in volts × scale + offset. Use a conditioned linear analog output; never apply more than 3.3 V to an ESP32 ADC pin.':(activeMode==='pulse-total'?'Formula: value = pulse count in the upload interval × scale + offset.':'Formula: value = pulse rate in pulses/second × scale + offset.');dialog.showModal();});});byId('expSensorApply').addEventListener('click',function(){var selectedPin=activeMode==='analog'?analogPin.value:pulsePin.value;var scaleValue=Number(scaleInput.value);var offsetValue=Number(offsetInput.value);if(!selectedPin||!Number.isFinite(scaleValue)||scaleValue<=0||!Number.isFinite(offsetValue)){help.textContent='Select a GPIO and enter a positive scale plus a valid offset.';return;}byId('exp_'+activeKey+'_pin').value=selectedPin;byId('exp_'+activeKey+'_scale').value=String(scaleValue);byId('exp_'+activeKey+'_offset').value=String(offsetValue);syncSensor(activeKey);dialog.close();});byId('expSensorClear').addEventListener('click',function(){if(!activeKey){return;}byId('exp_'+activeKey+'_pin').value='';byId('exp_'+activeKey+'_scale').value='1';byId('exp_'+activeKey+'_offset').value='0';syncSensor(activeKey);dialog.close();});byId('expSensorCancel').addEventListener('click',function(){dialog.close();});document.querySelectorAll('[data-exp-setup]').forEach(function(button){syncSensor(button.getAttribute('data-exp-setup'));});})();</script>";
   body += "<script>(function(){var dual=document.getElementById('dual_tube_enabled');var section=document.getElementById('tube2ProfileSection');var preset=document.getElementById('tube2_preset');var dead=document.getElementById('tube2_dead_time_us');var conv=document.getElementById('tube2_conversion_factor');var range=document.getElementById('tube2VoltageRange');var note=document.getElementById('tube2ProfileNote');var name=document.getElementById('tube2ProfileName');if(!dual||!section||!preset||!dead||!conv){return;}function syncPreset(){var option=preset.options[preset.selectedIndex];var custom=preset.value==='custom';dead.readOnly=!custom;conv.readOnly=!custom;dead.setAttribute('aria-readonly',custom?'false':'true');conv.setAttribute('aria-readonly',custom?'false':'true');if(!custom&&option){dead.value=option.getAttribute('data-dead-us')||dead.value;conv.value=option.getAttribute('data-conv')||conv.value;}if(range&&option){var low=option.getAttribute('data-vmin');var high=option.getAttribute('data-vmax');range.textContent=low&&high?low+'-'+high+' V':'Verify against datasheet';}if(note&&option){note.textContent=option.getAttribute('data-note')||'';}if(name&&option){name.textContent=option.text.split(' (')[0]||option.text;}}function syncSection(){var enabled=dual.checked;section.style.display=enabled?'':'none';[preset,dead,conv].forEach(function(control){control.disabled=!enabled;});}preset.addEventListener('change',syncPreset);dual.addEventListener('change',syncSection);syncPreset();syncSection();})();</script>";
+  body += "<script>(function(){function wire(p){var select=document.getElementById(p==='tube'?'tube_preset':'tube2_preset');var facts=document.getElementById(p+'PresetFacts');var fields=document.getElementById(p+'CustomFields');var deadText=document.getElementById(p+'DeadText');var convText=document.getElementById(p+'ConvText');if(!select||!facts||!fields){return;}function update(){var option=select.options[select.selectedIndex];var custom=select.value==='custom';facts.style.display=custom?'none':'';fields.style.display=custom?'':'none';if(option&&!custom){if(deadText){deadText.textContent=(option.getAttribute('data-dead-us')||'')+' us';}if(convText){convText.textContent=(option.getAttribute('data-conv')||'')+' uSv/h per CPM';}}}select.addEventListener('change',update);update();}wire('tube');wire('tube2');var dual=document.getElementById('dual_tube_enabled');if(dual){function syncV(){['tube2_vmin','tube2_vmax'].forEach(function(id){var el=document.getElementById(id);if(el){el.disabled=!dual.checked;}});}dual.addEventListener('change',syncV);syncV();}})();</script>";
   body += "<script>(function(){function syncCode(selectId,codeId){var select=document.getElementById(selectId);var code=document.getElementById(codeId);if(!select||!code){return;}function update(){var option=select.options[select.selectedIndex];code.textContent=option?option.getAttribute('data-exp-id')||'0x00':'0x00';}select.addEventListener('change',update);update();}syncCode('tube_preset','tubeExpCode');syncCode('tube2_preset','tube2ExpCode');})();</script>";
   body += "<script>(function(){function byId(id){return document.getElementById(id);}var dialog=byId('hardwarePinSetupDialog');var title=byId('hardwarePinSetupTitle');var help=byId('hardwarePinSetupHelp');var i2cRows=byId('hardwareI2cRows');var analogRow=byId('hardwareAnalogRow');var pulseRow=byId('hardwarePulseRow');var sda=byId('hardwarePinSda');var scl=byId('hardwarePinScl');var analogPin=byId('hardwareAnalogPin');var pulsePin=byId('hardwarePulsePin');var target='';var mode='';document.querySelectorAll('[data-pin-setup]').forEach(function(button){button.addEventListener('click',function(){target=button.getAttribute('data-pin-setup');mode=target==='i2c'?'i2c':((target==='hv_adc_pin'||target==='hcho_adc_pin')?'analog':'pulse');title.textContent='Configure '+(target==='i2c'?'shared I2C bus':target.replaceAll('_',' '));i2cRows.style.display=mode==='i2c'?'':'none';analogRow.style.display=mode==='analog'?'':'none';pulseRow.style.display=mode==='pulse'?'':'none';if(mode==='i2c'){sda.value=byId('i2c_sda_pin').value;scl.value=byId('i2c_scl_pin').value;help.textContent='These pins are shared by BME680, HM3301, and TSL2561. Reboot after applying.';}else if(mode==='analog'){analogPin.value=byId(target).value;help.textContent='Select an ADC1 input. Never apply more than 3.3 V to an ESP32 GPIO.';}else{pulsePin.value=byId(target).value;help.textContent='Select a digital input GPIO. Reboot after applying pin changes.';}dialog.showModal();});});byId('hardwarePinApply').addEventListener('click',function(){if(mode==='i2c'){if(!sda.value||!scl.value||sda.value===scl.value){help.textContent='Select two distinct GPIO pins for SDA and SCL.';return;}byId('i2c_sda_pin').value=sda.value;byId('i2c_scl_pin').value=scl.value;byId('pinSummary_i2c').textContent='GPIO'+sda.value+' / GPIO'+scl.value;}else{var pin=mode==='analog'?analogPin.value:pulsePin.value;if(!pin){help.textContent='Select a GPIO pin before applying.';return;}byId(target).value=pin;var summary=byId('pinSummary_'+target);if(summary){summary.textContent='GPIO'+pin;}}dialog.close();});byId('hardwarePinCancel').addEventListener('click',function(){dialog.close();});var dual=byId('dual_tube_enabled');var tube2Row=byId('tube2PinConfigRow');if(dual&&tube2Row){function updateTube2Pin(){tube2Row.style.display=dual.checked?'':'none';}dual.addEventListener('change',updateTube2Pin);updateTube2Pin();}})();</script>";
   body += "<script>(function(){var dialog=document.getElementById('hardwarePinSetupDialog');var title=document.getElementById('hardwarePinSetupTitle');var help=document.getElementById('hardwarePinSetupHelp');var i2cRows=document.getElementById('hardwareI2cRows');var analogRow=document.getElementById('hardwareAnalogRow');var pulseRow=document.getElementById('hardwarePulseRow');var sda=document.getElementById('hardwarePinSda');var scl=document.getElementById('hardwarePinScl');var analogPin=document.getElementById('hardwareAnalogPin');var pulsePin=document.getElementById('hardwarePulsePin');var target='';var mode='';document.querySelectorAll('[data-pin-setup]').forEach(function(button){button.addEventListener('click',function(){target=button.getAttribute('data-pin-setup');mode=target==='i2c'?'i2c':((target==='hv_adc_pin'||target==='hcho_adc_pin')?'analog':'pulse');title.textContent='Configure '+(target==='i2c'?'shared I2C bus':target.replace(/_/g,' '));i2cRows.style.display=mode==='i2c'?'':'none';analogRow.style.display=mode==='analog'?'':'none';pulseRow.style.display=mode==='pulse'?'':'none';if(mode==='i2c'){sda.value=document.getElementById('i2c_sda_pin').value;scl.value=document.getElementById('i2c_scl_pin').value;help.textContent='Shared by BME680, HM3301, and TSL2561. Reboot after saving pin changes.';}else if(mode==='analog'){analogPin.value=document.getElementById(target).value;help.textContent='Choose an ADC1 pin. Never apply more than 3.3 V to an ESP32 GPIO.';}else{pulsePin.value=document.getElementById(target).value;help.textContent='Choose a supported digital input pin. Reboot after saving pin changes.';}dialog.showModal();});});document.getElementById('hardwarePinApply').addEventListener('click',function(){if(mode==='i2c'){if(!sda.value||!scl.value||sda.value===scl.value){help.textContent='Select distinct SDA and SCL pins.';return;}document.getElementById('i2c_sda_pin').value=sda.value;document.getElementById('i2c_scl_pin').value=scl.value;document.getElementById('pinSummary_i2c').textContent='GPIO'+sda.value+' / GPIO'+scl.value;}else{var pin=mode==='analog'?analogPin.value:pulsePin.value;if(!pin){help.textContent='Select a pin before applying.';return;}document.getElementById(target).value=pin;var summary=document.getElementById('pinSummary_'+target);if(summary){summary.textContent='GPIO'+pin;}}dialog.close();});document.getElementById('hardwarePinCancel').addEventListener('click',function(){dialog.close();});var dual=document.getElementById('dual_tube_enabled');var tube2Row=document.getElementById('tube2PinConfigRow');if(dual&&tube2Row){function syncTube2(){tube2Row.style.display=dual.checked?'':'none';}dual.addEventListener('change',syncTube2);syncTube2();}})();</script>";
@@ -3399,6 +3611,8 @@ void handleConfigPath()
 
 void handleWifiScanPagePath()
 {
+  if (!requireAdminAuth()) return;
+
   bool forceRescan = server.hasArg("rescan");
   int networkCount = WiFi.scanComplete();
 
@@ -3456,6 +3670,8 @@ void handleWifiScanPagePath()
 
 void handleWifiScanPath()
 {
+  if (!requireAdminAuth()) return;
+
   const String action = server.arg("action");
 
   if (action == "start")
@@ -3495,6 +3711,7 @@ void handleWifiScanPath()
 
 void handleHistoryCsvPath()
 {
+  server.sendHeader("Cache-Control", "private, max-age=30");
   if (!spiffsMounted)
   {
     server.send(503, "text/plain; charset=utf-8", "SPIFFS unavailable");
@@ -3520,6 +3737,8 @@ void handleHistoryCsvPath()
 
 void handleHistoryDeletePath()
 {
+  if (!requireAdminAuth()) return;
+
   String body;
   body.reserve(700);
 
@@ -3578,7 +3797,7 @@ void handleGraphsPath()
   body += "<div class='col-12 col-xl-8'><div class='card h-100'><div class='card-body'>";
   body += "<h2 class='h5 mb-3'>History Actions</h2>";
   body += "<p class='hint mb-3'>Use this page for longer local trends than the live dashboard keeps in browser memory. Reload fetches the retained CSV directly from SPIFFS.</p>";
-  body += "<div class='d-flex flex-wrap gap-2'><button type='button' class='btn btn-primary' id='historyReload'>Reload History</button><a class='btn btn-outline-secondary' href='/history.csv'>Download CSV</a><form method='post' action='/history-delete' onsubmit=\"return confirm('Delete the retained history CSV from SPIFFS?');\" class='d-inline'><button type='submit' class='btn btn-outline-secondary'>Delete CSV</button></form><a class='btn btn-outline-secondary' href='/'>Back to Dashboard</a></div>";
+  body += "<div class='d-flex flex-wrap gap-2'><button type='button' class='btn btn-primary' id='historyReload'>Reload History</button><a class='btn btn-outline-secondary' href='/history.csv'>Download CSV</a><a class='btn btn-outline-secondary' href='/'>Back to Dashboard</a></div>";
   body += "<div class='mt-4'><h3 class='h6 mb-3'>SPIFFS File Listing</h3>" + buildSpiffsDirectoryHtml() + "</div>";
   body += "</div></div></div>";
   body += "</div>";
@@ -3588,6 +3807,7 @@ void handleGraphsPath()
   body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>IAQ and CO2</h2><canvas id='graphsAir' height='90'></canvas></div></div>";
   body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>Particulate Matter</h2><canvas id='graphsPm' height='90'></canvas></div></div>";
   body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>HV, Luminosity, HCHO &amp; VOC</h2><canvas id='graphsEnv' height='90'></canvas></div></div>";
+    body += "<script>window.cfgEnabled=" + buildExpEnabledJson() + ";</script>";
     body += "<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js'></script>";
     body += "<script>(function(){"
       "const charts={};let lastRows=[];let palette={};"
@@ -3600,8 +3820,9 @@ void handleGraphsPath()
       "function parseCsv(text){const lines=text.trim().split(/\\r?\\n/);if(lines.length<=1){return [];}const conv=" + String(activeTubeConversionFactor, 6) + ";return lines.slice(1).map(line=>line.trim()).filter(Boolean).map(line=>{const cols=line.split(',');const n=cols.length;if(n<12){return null;}const epoch=Number(cols[0]);if(!Number.isFinite(epoch)||epoch<=0){return null;}if(n>=16){return{epoch:epoch,cpm:Number(cols[1])||0,tube1:Number(cols[2])||0,tube2:Number(cols[3])||0,temp:(Number(cols[4])||0)/10,humidity:(Number(cols[5])||0)/10,pressure:(Number(cols[6])||0)/10,iaq:(Number(cols[7])||0)/10,co2:Number(cols[8])||0,voc:(Number(cols[9])||0)/100,pm01:Number(cols[10])||0,pm25:Number(cols[11])||0,pm10:Number(cols[12])||0,hv:(Number(cols[13])||0)/10,luminosity:Number(cols[14])||0,hcho:(Number(cols[15])||0)/1000,dose:(Number(cols[1])||0)*conv};}if(n>=14){return{epoch:epoch,cpm:Number(cols[1])||0,tube1:0,tube2:0,temp:(Number(cols[2])||0)/10,humidity:(Number(cols[3])||0)/10,pressure:(Number(cols[4])||0)/10,iaq:(Number(cols[5])||0)/10,co2:Number(cols[6])||0,voc:(Number(cols[7])||0)/100,pm01:Number(cols[8])||0,pm25:Number(cols[9])||0,pm10:Number(cols[10])||0,hv:(Number(cols[11])||0)/10,luminosity:Number(cols[12])||0,hcho:(Number(cols[13])||0)/1000,dose:(Number(cols[1])||0)*conv};}return{epoch:epoch,cpm:Number(cols[1])||0,tube1:0,tube2:0,temp:(Number(cols[2])||0)/10,humidity:(Number(cols[3])||0)/10,pressure:0,iaq:(Number(cols[4])||0)/10,co2:Number(cols[5])||0,voc:0,pm01:Number(cols[6])||0,pm25:Number(cols[7])||0,pm10:Number(cols[8])||0,hv:(Number(cols[9])||0)/10,luminosity:Number(cols[10])||0,hcho:(Number(cols[11])||0)/1000,dose:(Number(cols[1])||0)*conv};}).filter(Boolean);}"
       "function updateMeta(rows){const meta=document.getElementById('historyMeta');if(!meta){return;}if(!rows.length){meta.className='alert alert-warning mt-3 mb-0';meta.textContent='No retained history samples yet. Wait for a 61-second cycle to complete.';return;}const first=rows[0].epoch;const last=rows[rows.length-1].epoch;const hours=((last-first)/3600).toFixed(1);meta.className='alert alert-success mt-3 mb-0';meta.innerHTML='Loaded <strong>'+String(rows.length)+'</strong> retained samples from <span class=\\'mono\\'>/history.csv</span>. Range: <strong>'+hours+' hours</strong> from '+formatStamp(first)+' to '+formatStamp(last)+'.';}"
       "function renderCharts(rows){lastRows=rows.slice();syncThemePalette();destroyCharts();charts.dose=makeChart('graphsDose',[dataset('Dose \u00B5Sv/h',palette.dose),dataset('CPM',palette.cpm),dataset('Tube 1 CPS',palette.tube1),dataset('Tube 2 CPS',palette.tube2)]);charts.th=new Chart(document.getElementById('graphsTempHumidity'),{type:'line',data:{labels:[],datasets:[{label:'Temp \u00B0C',data:[],borderColor:palette.temp,backgroundColor:palette.temp+'22',fill:false,tension:.22,pointRadius:0,borderWidth:2,yAxisID:'y'},{label:'Humidity %',data:[],borderColor:palette.humidity,backgroundColor:palette.humidity+'22',fill:false,tension:.22,pointRadius:0,borderWidth:2,yAxisID:'y'},{label:'Pressure hPa',data:[],borderColor:palette.pressure,backgroundColor:palette.pressure+'22',fill:false,tension:.22,pointRadius:0,borderWidth:2,yAxisID:'y2'}]},options:{responsive:true,animation:false,interaction:{mode:'index',intersect:false},scales:{x:{ticks:{color:palette.text,maxTicksLimit:10},grid:{color:palette.grid}},y:{ticks:{color:palette.text},grid:{color:palette.grid}},y2:{position:'right',ticks:{color:palette.text},grid:{drawOnChartArea:false}}},plugins:{legend:{labels:{color:palette.text}}}}});charts.air=makeChart('graphsAir',[dataset('IAQ',palette.iaq),dataset('CO2 ppm',palette.co2)]);charts.pm=makeChart('graphsPm',[dataset('PM1.0',palette.pm1),dataset('PM2.5',palette.pm25),dataset('PM10',palette.pm10)]);charts.env=makeChart('graphsEnv',[dataset('Tube HV V',palette.hv),dataset('Luminosity lux',palette.light),dataset('HCHO ppm',palette.hcho),dataset('VOC ppm',palette.voc)]);const labels=rows.map(row=>formatStamp(row.epoch));charts.dose.data.labels=labels;charts.th.data.labels=labels;charts.air.data.labels=labels;charts.pm.data.labels=labels;charts.env.data.labels=labels;charts.dose.data.datasets[0].data=rows.map(row=>row.dose);charts.dose.data.datasets[1].data=rows.map(row=>row.cpm);charts.dose.data.datasets[2].data=rows.map(row=>row.tube1);charts.dose.data.datasets[3].data=rows.map(row=>row.tube2);charts.th.data.datasets[0].data=rows.map(row=>row.temp);charts.th.data.datasets[1].data=rows.map(row=>row.humidity);charts.th.data.datasets[2].data=rows.map(row=>row.pressure);charts.air.data.datasets[0].data=rows.map(row=>row.iaq);charts.air.data.datasets[1].data=rows.map(row=>row.co2);charts.pm.data.datasets[0].data=rows.map(row=>row.pm01);charts.pm.data.datasets[1].data=rows.map(row=>row.pm25);charts.pm.data.datasets[2].data=rows.map(row=>row.pm10);charts.env.data.datasets[0].data=rows.map(row=>row.hv);charts.env.data.datasets[1].data=rows.map(row=>row.luminosity);charts.env.data.datasets[2].data=rows.map(row=>row.hcho);charts.env.data.datasets[3].data=rows.map(row=>row.voc);Object.values(charts).forEach(chart=>chart.update());}"
-      "function refreshChartTheme(){if(lastRows.length){renderCharts(lastRows);}}"
-      "async function loadHistory(){const meta=document.getElementById('historyMeta');if(meta){meta.className='alert alert-secondary mt-3 mb-0';meta.textContent='Loading retained samples from /history.csv...';}try{const response=await fetch('/history.csv?ts='+Date.now(),{cache:'no-store'});if(!response.ok){throw new Error('history fetch failed');}const csv=await response.text();const rows=parseCsv(csv);updateMeta(rows);renderCharts(rows);}catch(error){if(meta){meta.className='alert alert-danger mt-3 mb-0';meta.textContent='Failed to load /history.csv. Check SPIFFS status and try again.';}destroyCharts();lastRows=[];}}"
+      "function refreshChartTheme(){if(lastRows.length){renderCharts(lastRows);applyEnabled();}}"
+      "function applyEnabled(){const en=window.cfgEnabled||{};const map={'Dose':'cpm','CPM':'cpm','Tube 1 CPS':'cpm','Tube 2 CPS':'tube2','Temp':'temp','Humidity':'humidity','Pressure':'pressure','IAQ':'voc','CO2':'co2','PM1.0':'pm1','PM2.5':'pm25','PM10':'pm10','Tube HV':'hv','Luminosity':'illuminance','HCHO':'ch2o','VOC':'voc'};Object.keys(charts).forEach(k=>{const c=charts[k];c.data.datasets=c.data.datasets.filter(d=>{const key=Object.keys(map).find(p=>d.label.indexOf(p)===0);return !key||en[map[key]]!==false;});const card=c.canvas.closest('.card');if(card){card.style.display=c.data.datasets.length?'':'none';}c.update();});}"
+      "async function loadHistory(){const meta=document.getElementById('historyMeta');if(meta){meta.className='alert alert-secondary mt-3 mb-0';meta.textContent='Loading retained samples from /history.csv...';}try{const response=await fetch('/history.csv?ts='+Date.now(),{cache:'no-store'});if(!response.ok){throw new Error('history fetch failed');}const csv=await response.text();const rows=parseCsv(csv);updateMeta(rows);renderCharts(rows);applyEnabled();}catch(error){if(meta){meta.className='alert alert-danger mt-3 mb-0';meta.textContent='Failed to load /history.csv. Check SPIFFS status and try again.';}destroyCharts();lastRows=[];}}"
       "const reloadButton=document.getElementById('historyReload');if(reloadButton){reloadButton.addEventListener('click',loadHistory);}document.addEventListener('envLoggerThemeChanged',refreshChartTheme);syncThemePalette();loadHistory();"
       "})();</script>";
 
@@ -3610,6 +3831,8 @@ void handleGraphsPath()
 
 void handleRebootPath()
 {
+  if (!requireAdminAuth()) return;
+
   String notice;
   String noticeClass = "success";
   if (!saveRuntimeSettingsFromRequest(notice, noticeClass))
@@ -3640,6 +3863,8 @@ void handleRebootPath()
 
 void handleSimpleRebootPath()
 {
+  if (!requireAdminAuth()) return;
+
   String body;
   body.reserve(480);
   body += "<div class='card'><div class='card-body'>";
@@ -4151,25 +4376,36 @@ static bool appendHistorySample(time_t sampleEpoch)
   snprintf(
     lineBuffer,
     sizeof(lineBuffer),
-    "%lu,%lu,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%ld\n",
+    "%lu,%lu,%lu,%lu",
     (unsigned long)sampleEpoch,
     cpm,
     actual_cps_1,
-    actual_cps_2,
-    tempCx10,
-    humidityPctX10,
-    pressureHpaX10,
-    iaqX10,
-    co2Ppm,
-    vocPpmX100,
-    var_pm01,
-    var_pm25,
-    var_pm10,
-    tubeVoltageX10,
-    luminosity,
-    hchoPpb);
+    actual_cps_2);
 
-  historyFile.print(lineBuffer);
+  // Disabled EXP sensors are written as empty cells so the column layout stays fixed.
+  String line = String(lineBuffer);
+  auto addField = [&line](bool enabled, long value) {
+    line += ',';
+    if (enabled)
+    {
+      line += String(value);
+    }
+  };
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TEMPERATURE), tempCx10);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HUMIDITY), humidityPctX10);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PRESSURE), pressureHpaX10);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_VOC), iaqX10);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CO2), co2Ppm);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_VOC), vocPpmX100);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM1), (long)var_pm01);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM25), (long)var_pm25);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM10), (long)var_pm10);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV), tubeVoltageX10);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_ILLUMINANCE), (long)luminosity);
+  addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CH2O), hchoPpb);
+  line += '\n';
+
+  historyFile.print(line);
   historyFile.close();
 
   historyRowCount++;
@@ -4214,7 +4450,13 @@ static void pruneHistoryLogIfNeeded(void)
   }
 
   size_t keepRowCount = getHistoryRetentionSamples();
-  if (keepRowCount >= historyRowCount)
+  // Hysteresis: rewrite the file only after ~10% overshoot to limit flash wear
+  size_t pruneSlack = keepRowCount / 10U;
+  if (pruneSlack < 5U)
+  {
+    pruneSlack = 5U;
+  }
+  if (historyRowCount <= (keepRowCount + pruneSlack))
   {
     return;
   }
@@ -4751,6 +4993,18 @@ std::vector<String> webPageChunks()
     + "  co2:  mkChart('cCo2', [dCo2]),"
     + "  pm:   mkChart('cPm',  [dPm1,dPm25,dPm10])"
     + "};"
+    + "const EXPEN=" + buildExpEnabledJson() + ";"
+    + "function applyExpVisibility(){"
+    + "  const st=document.createElement('style');st.textContent='.exp-off{display:none!important}';document.head.appendChild(st);"
+    + "  const hideCard=(id,key)=>{if(EXPEN[key]===false){const n=byId(id);const c=n?n.closest('.card'):null;if(c)c.classList.add('exp-off');}};"
+    + "  const hideChart=(id,keys)=>{if(keys.every(k=>EXPEN[k]===false)){const n=byId(id);const c=n?n.closest('.chart-card'):null;if(c)c.classList.add('exp-off');}};"
+    + "  [['doseValue','cpm'],['cpmValue','cpm'],['tube1Value','cpm'],['cpm1Value','cpm'],['hvValue','hv'],['hvDriveValue','hvduty'],['iaqValue','voc'],['co2Value','co2'],['vocValue','voc'],['hchoValue','ch2o'],['pm01Value','pm1'],['pm25Value','pm25'],['pm10Value','pm10'],['tempValue','temp'],['pressureValue','pressure'],['humidityValue','humidity'],['luminosityValue','illuminance']].forEach(p=>hideCard(p[0],p[1]));"
+    + "  if(EXPEN.cpm===false){['tube2Card','cpm2Card'].forEach(id=>{const n=byId(id);if(n)n.classList.add('exp-off');});}"
+    + "  hideChart('cDose',['cpm']);hideChart('cCpm',['cpm']);hideChart('cCps',['cpm']);hideChart('cIaq',['voc']);hideChart('cCo2',['co2']);"
+    + "  hideChart('cTH',['temp','humidity','pressure']);hideChart('cPm',['pm1','pm25','pm10']);"
+    + "  [[dTemp,'temp'],[dHum,'humidity'],[dPressure,'pressure'],[dPm1,'pm1'],[dPm25,'pm25'],[dPm10,'pm10']].forEach(p=>{if(EXPEN[p[1]]===false)p[0].hidden=true;});"
+    + "  Object.values(charts).forEach(chart=>{chart.options.plugins.legend.labels.filter=(item,data)=>!data.datasets[item.datasetIndex].hidden;chart.update();});"
+    + "}"
     + "function updateChartTheme(){Object.values(charts).forEach(chart=>{chart.options.scales.x.ticks.color=C.text;chart.options.scales.x.grid.color=C.grid;chart.options.scales.y.ticks.color=C.text;chart.options.scales.y.grid.color=C.grid;if(chart.options.scales.y2){chart.options.scales.y2.ticks.color=C.text;}chart.options.plugins.legend.labels.color=C.text;chart.update();});}"
     + "function updateHeader(d){"
     + "  if(d.clock)setText('clockValue',String(d.clock));"
@@ -4914,6 +5168,7 @@ std::vector<String> webPageChunks()
     + "  }catch(e){console.warn('poll error',e);}"
     + "}"
     + "initTheme();"
+    + "applyExpVisibility();"
     + "poll();"
     + "setInterval(poll,FAST_POLL_MS);"
     + "</script>"

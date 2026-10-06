@@ -141,6 +141,8 @@ No firmware rebuild is required to change any of these parameters.
 
 ![Config page screenshot](images/config.png)
 
+A **Jump to section** panel above the setup notes links to each settings section.
+
 #### Network
 | Setting | Default | Notes |
 |---------|---------|-------|
@@ -160,9 +162,12 @@ No firmware rebuild is required to change any of these parameters.
 #### Radiation
 | Setting | Default | Notes |
 |---------|---------|-------|
-| Tube preset | SBM-19 | Select from 9 presets or Custom |
-| Dead time (µs) | 250 | Per-tube, applied each second |
-| Conversion factor (µSv/h per CPM) | 0.001500 | Dose calculation coefficient |
+| Tube preset (per tube) | SBM-19 | Select from 9 presets or Custom |
+| Active tube profile | read-only for presets | Presets show dead time, conversion factor and operating range as text |
+| Custom: dead time (µs) | 250 | Only editable with the Custom preset; stored per tube |
+| Custom: conversion factor (µSv/h per CPM) | 0.001500 | Only editable with the Custom preset; stored per tube |
+| Custom: operating voltage min / max (V) | blank | Optional; both or neither, min below max |
+| Dual tube | Off | Tube 2 has its own profile card, shown when enabled |
 | CPM gauge full-scale | 600 | Dashboard gauge maximum (50 – 10 000) |
 | HV calibration factor | 184.097 | Resistor-divider voltage multiplier |
 
@@ -181,6 +186,10 @@ No firmware rebuild is required to change any of these parameters.
 | Setting | Default | Notes |
 |---------|---------|-------|
 | History retention | 6 h | How many hours of CSV to keep on SPIFFS |
+| Download / Delete History CSV | n/a | Buttons in "Logging and Display" (delete needs admin login) |
+
+#### EXP sensors
+Each EXP sensor toggle controls more than the uRADMonitor upload: a disabled sensor is also hidden on the dashboard (cards and live charts), removed from the `/graphs` charts, and written as an empty cell in the history CSV. IAQ follows the VOC toggle; Dose, CPM and Tube 1 CPS follow the Tube 1 CPM toggle.
 
 #### Verbose serial
 | Setting | Default | Notes |
@@ -218,8 +227,8 @@ hv_v_x10,luminosity_lux,hcho_ppb
 | `luminosity_lux` | lux | `47` |
 | `hcho_ppb` | ppb | `12` |
 
-The `/history_recent.csv` file and its header can be downloaded at `/history.csv`.  
-The file is deleted (pruned to zero) via `DELETE /history` (accessible from `/config`).
+The `/history_recent.csv` file and its header can be downloaded at `/history.csv`. Columns of disabled EXP sensors are left empty.  
+The file is deleted via the **Delete History CSV** button on `/config` (`POST /history-delete`, admin login required).
 
 ---
 
@@ -341,14 +350,19 @@ Then edit `arduino_secrets.h`:
 #define SECRET_SSID    "YourWiFiSSID"
 #define SECRET_PASS    "YourWiFiPassword"
 
+// Admin login for /config, /update (OTA) and admin actions.
+// If SECRET_ADMIN_PASS is not defined these pages are unauthenticated.
+#define SECRET_ADMIN_USER "admin"
+#define SECRET_ADMIN_PASS "use-a-strong-password"
+
 // radmon.org
-#define SECRET_RAD_USER  "your_radmon_username"
-#define SECRET_RAD_PASS  "your_radmon_password"
+#define SECRET_USER_NAME    "your_radmon_username"
+#define SECRET_USER_PASS_01 "your_radmon_password"
 
 // uradmonitor
-#define SECRET_UR_USER   "your_uradmonitor_user_id"
-#define SECRET_UR_KEY    "your_uradmonitor_api_key"
-#define SECRET_UR_DEV    "your_uradmonitor_device_id"
+#define SECRET_USER_ID   "your_uradmonitor_user_id"
+#define SECRET_USER_KEY  "your_uradmonitor_api_key"
+#define SECRET_DEVICE_ID "your_uradmonitor_device_id"
 ```
 
 ### Partition scheme
@@ -403,6 +417,12 @@ Environmental_Stationary_Logger_V1.4/
 ---
 
 ## Firmware Changelog
+
+### v1.4e — Config page rework
+- Config page: responsive layout, jump-to-section panel, GPIO cards, calibration section
+- Per-tube profile cards: preset values as text; Custom exposes dead time, conversion factor and operating voltage min/max (persisted per tube)
+- Delete History CSV moved from `/graphs` to the config page
+- Disabled EXP sensors are hidden on the dashboard and `/graphs` and left empty in the history CSV
 
 ### v1.4d (2026-04-19) — Dashboard & telemetry expansion
 - Per-tube CPM cards (Tube 1, Tube 2) on dashboard
