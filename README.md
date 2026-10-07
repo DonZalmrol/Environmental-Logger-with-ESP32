@@ -13,16 +13,18 @@ It continuously samples ionising radiation (two GM tubes), air quality (IAQ / CO
 2. [Hardware](#hardware)
 3. [Web Interface](#web-interface)
    - [Dashboard (`/`)](#dashboard-)
+   - [Admin dashboard (`/admin`)](#admin-dashboard-admin)
    - [Graphs (`/graphs`)](#graphs-graphs)
    - [Configuration (`/config`)](#configuration-config)
-4. [CSV History Format](#csv-history-format)
-5. [JSON API (`/json`)](#json-api-json)
-6. [Upload Platforms](#upload-platforms)
-7. [Tube Presets](#tube-presets)
-8. [Getting Started](#getting-started)
-9. [File Structure](#file-structure)
-10. [Firmware Changelog](#firmware-changelog)
-11. [Author](#author)
+4. [Sensors and Calculations](#sensors-and-calculations)
+5. [CSV History Format](#csv-history-format)
+6. [JSON API (`/json`)](#json-api-json)
+7. [Upload Platforms](#upload-platforms)
+8. [Tube Presets](#tube-presets)
+9. [Getting Started](#getting-started)
+10. [File Structure](#file-structure)
+11. [Firmware Changelog](#firmware-changelog)
+12. [Author](#author)
 
 ---
 
@@ -77,9 +79,26 @@ I²C SDA/SCL  ──►  BME680, HM3301, TSL2561
 
 All pages share a dark-themed card-grid layout with a persistent navigation bar and a footer containing the firmware version badge (click to open the changelog dialog).
 
+Pages are split into **public** (sensor data only) and **admin** (device internals and settings, HTTP Basic auth).
+
+| Route | Access | Purpose |
+|-------|--------|---------|
+| `/`, `/graphs`, `/json`, `/history.csv`, `/health` | Public | Sensor dashboard, history graphs, trimmed JSON, CSV, health check |
+| `/admin`, `/admin/json` | Admin | Resources, network and upload status |
+| `/config`, `/ota-check`, `/wifi-scan`, `/history-delete`, `/reboot`, `/restart` | Admin | Settings and maintenance |
+| `/update` | Admin | ElegantOTA firmware upload |
+| `/logout` | Public | Ends the admin session (browser drops cached credentials) |
+
+Admin notes:
+- Credentials come from `SECRET_ADMIN_USER` / `SECRET_ADMIN_PASS` in `arduino_secrets.h`; use a strong password and keep the file out of version control.
+- The admin session expires after 15 minutes of inactivity.
+- State-changing requests (POST) must be same-origin (Origin/Referer host must match `Host` or `X-Forwarded-Host`).
+- Behind a reverse proxy (for example Zoraxy), forward the `Authorization` and `Host` headers unchanged.
+- Mockups of every page are in `images/` (open the `.html` files in a browser).
+
 ### Dashboard (`/`)
 
-The main page polls `/json` every second and updates all values live.
+The public page polls `/json` every 3 seconds and updates all values live. It shows no network, storage or upload details.
 
 ![Dashboard screenshot](images/dashboard.png)
 
@@ -87,6 +106,7 @@ The main page polls `/json` every second and updates all values live.
 - Combined CPM card with colour-coded gauge bar and estimated dose rate (µSv/h)
 - Tube 1 CPM and Tube 2 CPM individual cards
 - GM tube high voltage card with operating range indicator
+- Tube coincidence card (muon candidates per minute, with estimated accidental rate); shown only with two tubes and the counter enabled
 
 **Environmental section**
 - Temperature, humidity, pressure
@@ -97,11 +117,6 @@ The main page polls `/json` every second and updates all values live.
 - PM 1.0, PM 2.5, PM 10 (µg/m³)
 - Formaldehyde HCHO (ppb)
 - Luminosity (lux)
-
-**System section**
-- Upload status badges (radmon.org and uradmonitor) — green / amber / red
-- Core 0 / Core 1 CPU load, heap free, SPIFFS free
-- WiFi RSSI, uptime, NTP epoch
 
 **Live charts**
 
@@ -117,10 +132,23 @@ The main page polls `/json` every second and updates all values live.
 
 ---
 
+### Admin dashboard (`/admin`)
+
+Admin-only view of device internals; it has no sensor cards or charts. Polls `/admin/json` every second.
+
+![Admin dashboard screenshot](images/admin.png)
+
+- **Resources:** CPU core 0 / 1 load, loop active time, free heap, app partition, disk space, I²C device count
+- **WiFi:** SSID, RSSI, signal quality, IP, gateway, MAC
+- **Uploads:** radmon.org and uRADMonitor status badge, last upload time and values
+- Nav extras: OTA Check, OTA Update, JSON, Logout. `/ota-check` also shows the SPIFFS file listing.
+
+---
+
 ### Graphs (`/graphs`)
 
 Renders the on-device CSV history with Chart.js.  
-The date range shown is determined by the history retention window configured in `/config`.
+The date range shown is determined by the history retention window configured in `/config`. The page is public and hides the device IP, hostname and file listing.
 
 ![Graphs page screenshot](images/graphs.png)
 
@@ -143,7 +171,7 @@ No firmware rebuild is required to change any of these parameters.
 
 ![Config page screenshot](images/config.png)
 
-A **Jump to section** panel above the setup notes links to each settings section.
+A **Jump to section** panel above the setup notes links to each settings section. Section order: General, WiFi, Time and Region, Diagnostics, Logging and Display, Radiation Tube Setup, GPIO Mapping, EXP Sensor Selection, Calibration, radmon.org, uRADMonitor.
 
 #### Network
 | Setting | Default | Notes |
@@ -170,6 +198,8 @@ A **Jump to section** panel above the setup notes links to each settings section
 | Custom: conversion factor (µSv/h per CPM) | 0.001500 | Only editable with the Custom preset; stored per tube |
 | Custom: operating voltage min / max (V) | blank | Optional; both or neither, min below max |
 | Dual tube | Off | Tube 2 has its own profile card, shown when enabled |
+| Tube coincidence counter | On | Counts pulses on both tubes within the window; needs dual tube, applied after reboot. Not uploaded. Best with the tubes stacked vertically |
+| Coincidence window (µs) | 50 | 5 – 1000; accidental rate is estimated as 2·window·R1·R2 |
 | CPM gauge full-scale | 600 | Dashboard gauge maximum (50 – 10 000) |
 | HV calibration factor | 184.097 | Resistor-divider voltage multiplier |
 
@@ -183,6 +213,7 @@ A **Jump to section** panel above the setup notes links to each settings section
 |---------|---------|-------|
 | radmon.org upload | Enabled | Toggle on / off |
 | uradmonitor upload | Enabled | Toggle on / off |
+| CPM source (per platform) | Combined moving avg (radmon), Tube 1 moving avg (uRADMonitor) | Tube 1 / Tube 2 / combined, raw or moving average |
 
 #### History
 | Setting | Default | Notes |
@@ -191,12 +222,88 @@ A **Jump to section** panel above the setup notes links to each settings section
 | Download / Delete History CSV | n/a | Buttons in "Logging and Display" (delete needs admin login) |
 
 #### EXP sensors
-Each EXP sensor toggle controls more than the uRADMonitor upload: a disabled sensor is also hidden on the dashboard (cards and live charts), removed from the `/graphs` charts, and written as an empty cell in the history CSV. IAQ follows the VOC toggle; Dose, CPM and Tube 1 CPS follow the Tube 1 CPM toggle.
+The EXP list is one grid sorted by sensor id (01 to 1A); extra inputs (0A, 11, 14 to 19) need a pin and scale/offset via their Configure button. Each EXP sensor toggle controls more than the uRADMonitor upload: a disabled sensor is also hidden on the dashboard (cards and live charts), removed from the `/graphs` charts, and written as an empty cell in the history CSV. IAQ follows the VOC toggle; Dose, CPM and Tube 1 CPS follow the Tube 1 CPM toggle.
 
 #### Verbose serial
 | Setting | Default | Notes |
 |---------|---------|-------|
 | Serial debug output | Enabled | Toggle extra Serial.print output |
+
+---
+
+## Sensors and Calculations
+
+Every EXP field (id in hex) and how its value is produced. Fields can be disabled in `/config`; a disabled field is hidden on the dashboard and graphs and left empty in the history CSV.
+
+### Radiation (GM tubes)
+
+| Step | Calculation |
+|------|-------------|
+| Pulse counting | Each tube pin feeds an ESP32 PCNT hardware counter (rising edges, 100 ns glitch filter). The counter is read and cleared every second, giving raw counts per second $n$. |
+| Dead-time correction | $n_c = \dfrac{n}{1 - n\,\tau}$ with $\tau$ the tube dead time (seconds, from the tube preset). If $1 - n\tau \le 0$ the raw count is used and a warning is logged. |
+| CPM (moving average) | Corrected CPS values go into a rolling window (60 s per tube, 120 s combined). $\text{CPM} = \dfrac{\sum n_c}{N}\times 60$ where $N$ is the number of samples in the window. |
+| Combined CPM | Combined window CPM divided by 2 with two tubes (an average, not a sum), or by 1 with one tube. |
+| Dose rate | $\mu Sv/h = \text{CPM} \times k$ with $k$ the tube conversion factor (for example SBM-19: 0.0015 with $\tau$ = 250 µs). With two tubes the dose of each tube is calculated with its own $k$ and averaged. |
+| Raw upload source | Raw options use the latest corrected CPS $\times 60$. |
+
+EXP fields: `0B` Tube 1 CPM, `10` tube type id, `0E` / `0F` hardware and firmware version.
+
+### Tube coincidence (muon candidates)
+
+With two tubes, a GPIO interrupt on each tube pin timestamps every pulse. A pulse on one tube within the coincidence window $w$ (default 50 µs) of a pulse on the other counts as one coincidence. The dashboard shows the count over the last 60 s.
+
+Random (accidental) coincidences are estimated per minute as $A = 2\,w\,R_1 R_2 \times 60$ with $R_1, R_2$ the raw tube rates in counts per second. A rate clearly above $A$ suggests real coincident events (cosmic muons or showers). Tubes stacked one above the other give the most meaningful result. Not uploaded.
+
+### Tube high voltage (`0C`, `0D`)
+
+The tube supply is read through a divider on an ADC pin (default GPIO33):
+
+$$V_{adc} = \frac{\text{ADC} \times 3.4}{4096}, \qquad V_{tube} = V_{adc} \times F$$
+
+$F$ is the HV calibration factor (default 184.097, from $437.6\,V / 2.377\,V$ measured on the ESP32 Wrover-E). Re-measure the tube voltage with a high-impedance meter to calibrate your own board. The gauge shows 380 – 440 V as green and 350 – 475 V as the outer range.
+
+The HV duty cycle (`0D`) is an estimate: $\text{duty}\,\% = \mathrm{clamp}\!\left(\dfrac{V - 350}{125}\times 100,\;0,\;100\right)$.
+
+### Environment, BME688 via BSEC (`02`, `03`, `04`, `06`, `07`)
+
+The Bosch BSEC library runs on the BME688 and returns compensated values: temperature (°C, `02`), pressure (Pa, shown as hPa, `03`), relative humidity (%, `04`), the IAQ index (0 – 500, `06`) and CO₂ equivalent (ppm, `07`). IAQ accuracy is 0 stabilising, 1 uncertain, 2 calibrating, 3 calibrated; the BSEC state is saved to flash so calibration survives reboots. Values are only meaningful once accuracy reaches 3.
+
+### Particulates, HM3301 (`09`, `12`, `13`)
+
+The Grove HM3301 laser sensor reports PM1.0 (`12`), PM2.5 (`09`) and PM10 (`13`) in µg/m³ using the CF=1 standard-particle values. It is read once per 61 s cycle.
+
+### Illuminance, TSL2561 (`05`)
+
+The TSL2561 combines its broadband and infrared channels into visible-light lux using the sensor's built-in lux formula.
+
+### Formaldehyde, Grove HCHO (`08`)
+
+The analog output is read on an ADC pin (default GPIO34):
+
+$$R_s = \frac{4095}{\text{ADC}} - 1, \qquad \text{ppm} = 10^{\frac{\log_{10}(R_s/R_0) - 0.0827}{-0.4807}}$$
+
+$R_0$ is the clean-air baseline resistance (default 10.37, set under Calibration). The value is shown as ppb (ppm × 1000).
+
+### Device (`1A`)
+
+Wi-Fi signal (`1A`) is the RSSI in dBm. On the admin page it is also shown as a percentage: $\text{signal}\,\% = 2\,(\text{RSSI} + 100)$, clamped to 0 – 100.
+
+### Extra inputs (`0A`, `11`, `14` – `19`)
+
+These fields are off until a GPIO, scale and offset are configured with the Configure button. Wire only conditioned signals of at most 3.3 V to the ESP32.
+
+| Field | Unit | Input mode | Formula |
+|-------|------|-----------|---------|
+| `0A` Battery voltage | V | Analog | $V \times s + o$ |
+| `11` Noise level | dB | Analog | $V \times s + o$ |
+| `14` Ozone | ppb | Analog | $V \times s + o$ |
+| `15` Radon | Bq/m³ | Pulse rate | $\dfrac{\text{pulses}}{\Delta t} \times s + o$ |
+| `16` Wind speed | m/s | Pulse rate | $\dfrac{\text{pulses}}{\Delta t} \times s + o$ |
+| `17` Wind direction | degrees | Analog | $V \times s + o$ |
+| `18` Rain accumulation | mm | Pulse total | $\text{pulses} \times s + o$ |
+| `19` Irradiance | W/m² | Analog | $V \times s + o$ |
+
+$V$ is the ADC voltage in volts, $s$ the scale and $o$ the offset. Pulse inputs count falling edges; set $s$ to units per pulse (rain) or units per pulse/second (rate sensors).
 
 ---
 
@@ -236,7 +343,7 @@ The file is deleted via the **Delete History CSV** button on `/config` (`POST /h
 
 ## JSON API (`/json`)
 
-`GET /json` returns a JSON object updated every second by the main loop.
+`GET /json` is public and returns a trimmed JSON object (sensor values only, `no-store`, cached 1 s). Resource, network and upload fields are only in `/admin/json` (admin login). `GET /health` returns a minimal liveness response.
 
 ```jsonc
 {
@@ -259,11 +366,7 @@ The file is deleted via the **Delete History CSV** button on `/config` (`POST /h
   "pm10": 6,
   "hcho": 12.0,
   "luminosity": 47,
-  "unixTime": 1745012345,
-  "cpuLoad0": 12.4,
-  "cpuLoad1": 3.1,
-  "heapFree": 234512,
-  "fsFree": 819200
+  "unixTime": 1745012345
 }
 ```
 
@@ -402,11 +505,13 @@ Environmental_Stationary_Logger_V1.4/
 ├── images/
 │   ├── Hardware V1.jpeg                        Hardware photo
 │   ├── dashboard.html                          Browser-renderable dashboard preview (dummy data)
+│   ├── admin.html                              Browser-renderable admin dashboard preview
 │   ├── graphs.html                             Browser-renderable graphs preview (dummy data)
 │   ├── config.html                             Browser-renderable config page preview
 │   ├── config-v1.4e.html                       Config preview snapshot for v1.4e
 │   ├── backup_2026-10-06/                      Previous mockup versions
 │   ├── dashboard.png                           Dashboard screenshot
+│   ├── admin.png                               Admin dashboard screenshot
 │   ├── graphs.png                              Graphs screenshot
 │   └── config.png                              Config page screenshot
 ├── src/

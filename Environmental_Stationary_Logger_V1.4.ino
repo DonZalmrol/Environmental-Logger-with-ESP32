@@ -224,7 +224,7 @@ static const char* const FIRMWARE_CHANGELOG =
 // Keep a configurable recent history window: one sample is written every 61 seconds.
 static const char *const HISTORY_LOG_PATH = "/history_recent.csv";
 static const char *const HISTORY_LOG_TMP_PATH = "/history_recent.tmp";
-static const char *const HISTORY_LOG_HEADER = "epoch,cpm,cps_tube1,cps_tube2,temp_c_x10,humidity_pct_x10,pressure_hpa_x10,iaq_x10,co2_ppm,voc_ppm_x100,pm01_ugm3,pm25_ugm3,pm10_ugm3,hv_v_x10,luminosity_lux,hcho_ppb";
+static const char *const HISTORY_LOG_HEADER = "epoch,cpm,cps_tube1,cps_tube2,temp_c_x10,humidity_pct_x10,pressure_hpa_x10,iaq_x10,co2_ppm,voc_ppm_x100,pm01_ugm3,pm25_ugm3,pm10_ugm3,hv_v_x10,luminosity_lux,hcho_ppb,coinc_per_min";
 static const size_t HISTORY_RETENTION_SAMPLES_PER_HOUR = 60U;
 static const size_t DEFAULT_HISTORY_RETENTION_HOURS = 1U;
 static const size_t MAX_HISTORY_RETENTION_HOURS = 24U;
@@ -590,6 +590,37 @@ int activeHchoAdcPin = 34;
 int activeHvAdcPin = 33;
 int activeTube1PulsePin = 13;
 int activeTube2PulsePin = 14;
+bool activeCoincEnabled = true;
+uint32_t activeCoincWindowUs = 50;
+
+// Tube coincidence (muon candidate) detection, fed by GPIO ISRs on both tube pins.
+volatile uint32_t coincLastUs[2] = {0, 0};
+volatile bool coincPending[2] = {false, false};
+volatile uint32_t coincCount = 0;
+volatile uint32_t coincWindowUs = 50;
+static uint16_t coincRing[60] = {0};
+static float coincAccRing[60] = {0};
+static uint8_t coincRingIdx = 0;
+uint32_t coincPerMin = 0;
+float coincAccidentalPerMin = 0.0f;
+
+static void IRAM_ATTR handleCoincPulse(void *argument)
+{
+  uint32_t idx = (uint32_t)(uintptr_t)argument;
+  uint32_t other = 1U - idx;
+  uint32_t now = (uint32_t)esp_timer_get_time();
+  if (coincPending[other] && ((uint32_t)(now - coincLastUs[other]) <= coincWindowUs))
+  {
+    coincCount++;
+    coincPending[other] = false;
+    coincPending[idx] = false;
+  }
+  else
+  {
+    coincPending[idx] = true;
+  }
+  coincLastUs[idx] = now;
+}
 
 // Create rolling windows: combined radiation over 120 s, per-tube over 60 s
 movingAvg cps_sensor(120);
@@ -828,6 +859,12 @@ void setup()
     {
       Serial.println(F("WARNING: Pulse counters unavailable; radiation readings disabled"));
     }
+    else if (activeDualTubeEnabled && activeCoincEnabled)
+    {
+      coincWindowUs = activeCoincWindowUs;
+      attachInterruptArg(activeTube1PulsePin, handleCoincPulse, (void *)0, RISING);
+      attachInterruptArg(activeTube2PulsePin, handleCoincPulse, (void *)1, RISING);
+    }
 
     configureTimeRules();
     ntp.begin(activeNtpServer.c_str());
@@ -932,6 +969,20 @@ void loop()
       raw_cps_2 = 0;
       actual_cps_1 = 0;
       actual_cps_2 = 0;
+    }
+
+    {
+      uint32_t coincNow = __atomic_exchange_n(&coincCount, 0U, __ATOMIC_RELAXED);
+      if (!(activeDualTubeEnabled && activeCoincEnabled)) coincNow = 0;
+      coincRing[coincRingIdx] = (uint16_t)min<uint32_t>(coincNow, 65535U);
+      // Expected accidental coincidences per second: 2 * window * R1 * R2
+      coincAccRing[coincRingIdx] = 2.0f * (activeCoincWindowUs / 1e6f) * (float)raw_cps_1 * (float)raw_cps_2;
+      coincRingIdx = (coincRingIdx + 1) % 60;
+      uint32_t sum = 0;
+      float accSum = 0.0f;
+      for (int i = 0; i < 60; ++i) { sum += coincRing[i]; accSum += coincAccRing[i]; }
+      coincPerMin = sum;
+      coincAccidentalPerMin = accSum;
     }
 
     // Add combined CPS of both tubes as one datapoint per second (240-point = 240s window)
@@ -1325,6 +1376,8 @@ static void loadRuntimeSettings(void)
     activeHvAdcPin = 33;
     activeTube1PulsePin = 13;
     activeTube2PulsePin = 14;
+    activeCoincEnabled = true;
+    activeCoincWindowUs = 50;
     for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
     {
       extraExpSensorConfigs[sensorIndex] = {-1, 1.0f, 0.0f, false};
@@ -1381,6 +1434,8 @@ static void loadRuntimeSettings(void)
   activeHvAdcPin = settingsStore.getInt("hv_adc_pin", 33);
   activeTube1PulsePin = settingsStore.getInt("tube1_pin", 13);
   activeTube2PulsePin = settingsStore.getInt("tube2_pin", 14);
+  activeCoincEnabled = settingsStore.getBool("coinc_en", true);
+  activeCoincWindowUs = constrain((uint32_t)settingsStore.getUInt("coinc_win", 50), 5U, 1000U);
 
   if (!isValidWroverI2cPin(activeI2cSdaPin)) activeI2cSdaPin = 21;
   if (!isValidWroverI2cPin(activeI2cSclPin)) activeI2cSclPin = 22;
@@ -1594,6 +1649,8 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   bool radmonUploadEnabled = server.hasArg("radmon_upload_enabled");
   bool uradmonUploadEnabled = server.hasArg("urad_upload_enabled");
   bool dualTubeEnabled = server.hasArg("dual_tube_enabled");
+  bool coincEnabled = server.hasArg("coinc_enabled");
+  uint32_t coincWindow = constrain((long)server.arg("coinc_window").toInt(), 5L, 1000L);
 
   wifiSsid.trim();
   wifiPassword.trim();
@@ -1912,6 +1969,8 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   settingsStore.putString("rad_src", normalizeCpmSource(server.arg("radmon_cpm_source"), activeRadmonCpmSource.c_str()));
   settingsStore.putString("urad_src", normalizeCpmSource(server.arg("urad_cpm_source"), activeURadmonCpmSource.c_str()));
   settingsStore.putBool("dual_tube", dualTubeEnabled);
+  settingsStore.putBool("coinc_en", coincEnabled);
+  settingsStore.putUInt("coinc_win", coincWindow);
   if (timezoneOffsetValue.length() > 0)
   {
     settingsStore.putInt("tz_offset", (int)parsedTimezoneOffset);
@@ -3644,6 +3703,8 @@ void handleConfigPath()
   body += "<div class='col-md-6'><label class='form-label' for='tube_preset'>Tube 1 Type</label><select class='form-select' id='tube_preset' name='tube_preset'>" + buildTubePresetOptionsHtml(displayedTubePresetId) + "</select><div class='form-text'>EXP field 10 supports one tube ID and reports Tube 1. The selected type and calibration apply to Tube 1.</div></div>";
   body += buildTubeProfileCardHtml("tube", "Active tube profile", activeTubePresetLabel, formatExpTubeTypeCode(getUradTubeTypeId(displayedTubePresetId)), displayedTubeVoltageRange, displayedTubeNote, displayedTubeDeadTimeUs, displayedTubeConversionFactor, displayedTubeVMin, displayedTubeVMax, displayedTubePresetId == CUSTOM_TUBE_PRESET_ID, true, "");
   body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='dual_tube_enabled' name='dual_tube_enabled'" + String(activeDualTubeEnabled ? " checked" : "") + "><label class='form-check-label' for='dual_tube_enabled'>Enable second GM tube</label><div class='form-text'>When off, Tube 2 profile controls, pulse counting, and dashboard readings are hidden.</div></div></div>";
+  body += "<div class='col-md-8'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='coinc_enabled' name='coinc_enabled'" + String(activeCoincEnabled ? " checked" : "") + "><label class='form-check-label' for='coinc_enabled'>Tube coincidence (muon candidate) counter</label><div class='form-text'>Counts pulses seen on both tubes within the window below. Needs two tubes; applied after reboot. Best with the tubes stacked one above the other.</div></div></div>";
+  body += "<div class='col-md-4'><label class='form-label' for='coinc_window'>Coincidence window (us)</label><input class='form-control mono' type='number' min='5' max='1000' id='coinc_window' name='coinc_window' value='" + String(activeCoincWindowUs) + "'><div class='form-text'>5 - 1000, default 50.</div></div>";
   body += "<div class='col-12' id='tube2ProfileSection'" + String(activeDualTubeEnabled ? "" : " style='display:none'") + "><div class='row g-3'><div class='col-12'><h4 class='h6 mb-0'>Tube 2</h4></div>";
   body += "<div class='col-md-6'><label class='form-label' for='tube2_preset'>Tube 2 Type</label><select class='form-select' id='tube2_preset' name='tube2_preset'" + String(activeDualTubeEnabled ? "" : " disabled") + ">" + buildTubePresetOptionsHtml(displayedTube2PresetId) + "</select><div class='form-text'>Tube 2 uses its own dead time and dose conversion. EXP field 10 still reports Tube 1.</div></div>";
   body += buildTubeProfileCardHtml("tube2", "Active Tube 2 profile", activeTube2PresetLabel, formatExpTubeTypeCode(getUradTubeTypeId(displayedTube2PresetId)), displayedTube2VoltageRange, displayedTube2Note, displayedTube2DeadTimeUs, displayedTube2ConversionFactor, displayedTube2VMin, displayedTube2VMax, displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID, activeDualTubeEnabled, "EXP field 10 reports Tube 1 only.");
@@ -3675,7 +3736,7 @@ void handleConfigPath()
       expRows.push_back({code, "<div class='col'>" + buildExpToggleHtml(field, label, isExpSensorEnabled(activeExpSensorMask, flag), pinKey, pinText) + "</div>"});
     };
     auto addPlain = [&](int code, const char *field, const char *label, uint32_t flag) {
-      expRows.push_back({code, String("<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='") + field + "' name='" + field + "'" + (isExpSensorEnabled(activeExpSensorMask, flag) ? " checked" : "") + "><label class='form-check-label' for='" + field + "'>" + label + "</label></div></div>"});
+      expRows.push_back({code, "<div class='col'>" + buildExpToggleHtml(field, label, isExpSensorEnabled(activeExpSensorMask, flag), NULL, String()) + "</div>"});
     };
     addToggle(0x02, "exp_sensor_temperature", "Temperature (02)", EXP_SENSOR_TEMPERATURE, "i2c", sharedI2cSummary);
     addToggle(0x03, "exp_sensor_pressure", "Pressure (03)", EXP_SENSOR_PRESSURE, "i2c", sharedI2cSummary);
@@ -3702,10 +3763,10 @@ void handleConfigPath()
       String configuredStatus = sensorConfig.configured
         ? "GPIO" + String(sensorConfig.pin) + " | scale " + String(sensorConfig.scale, 4) + " | offset " + String(sensorConfig.offset, 4)
         : "Pin and calibration not configured";
-      String row = "<div class='col'><div class='d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2'>";
-      row += "<div><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='exp_sensor_" + String(sensorDefinition.key) + "' name='exp_sensor_" + String(sensorDefinition.key) + "'" + String(selected ? " checked" : "") + String(sensorConfig.configured ? "" : " disabled") + "><label class='form-check-label' for='exp_sensor_" + String(sensorDefinition.key) + "'>" + String(sensorDefinition.label) + "</label></div><div class='form-text' id='exp_" + String(sensorDefinition.key) + "_status'>" + configuredStatus + "</div></div>";
+      String row = "<div class='col'><div class='exp-sensor-control'>";
+      row += "<div class='form-check form-switch mb-0'><input class='form-check-input' type='checkbox' id='exp_sensor_" + String(sensorDefinition.key) + "' name='exp_sensor_" + String(sensorDefinition.key) + "'" + String(selected ? " checked" : "") + String(sensorConfig.configured ? "" : " disabled") + "><label class='form-check-label' for='exp_sensor_" + String(sensorDefinition.key) + "'>" + String(sensorDefinition.label) + "</label></div>";
       String inputMode = sensorDefinition.inputMode == ExpExtraInputMode::AnalogLinear ? "analog" : (sensorDefinition.inputMode == ExpExtraInputMode::PulseRate ? "pulse-rate" : "pulse-total");
-      row += "<button type='button' class='btn btn-sm btn-outline-secondary' data-exp-setup='" + String(sensorDefinition.key) + "' data-exp-label='" + String(sensorDefinition.label) + "' data-exp-mode='" + inputMode + "'>Configure</button>";
+      row += "<div class='exp-sensor-actions'><button type='button' class='btn btn-sm btn-outline-secondary' data-exp-setup='" + String(sensorDefinition.key) + "' data-exp-label='" + String(sensorDefinition.label) + "' data-exp-mode='" + inputMode + "'>Configure</button><span class='form-text exp-sensor-summary' id='exp_" + String(sensorDefinition.key) + "_status'>" + configuredStatus + "</span></div>";
       row += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_pin' name='exp_" + String(sensorDefinition.key) + "_pin' value='" + String(sensorConfig.configured ? String(sensorConfig.pin) : String("")) + "'>";
       row += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_scale' name='exp_" + String(sensorDefinition.key) + "_scale' value='" + String(sensorConfig.scale, 6) + "'>";
       row += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_offset' name='exp_" + String(sensorDefinition.key) + "_offset' value='" + String(sensorConfig.offset, 6) + "'>";
@@ -3966,7 +4027,6 @@ void handleGraphsPath()
   body += "<h2 class='h5 mb-3'>History Actions</h2>";
   body += "<p class='hint mb-3'>Use this page for longer local trends than the live dashboard keeps in browser memory. Reload fetches the retained CSV directly from SPIFFS.</p>";
   body += "<div class='d-flex flex-wrap gap-2'><button type='button' class='btn btn-primary' id='historyReload'>Reload History</button><a class='btn btn-outline-secondary' href='/history.csv'>Download CSV</a><a class='btn btn-outline-secondary' href='/'>Back to Dashboard</a></div>";
-  body += "<div class='mt-4'><h3 class='h6 mb-3'>SPIFFS File Listing</h3>" + buildSpiffsDirectoryHtml() + "</div>";
   body += "</div></div></div>";
   body += "</div>";
 
@@ -3975,6 +4035,11 @@ void handleGraphsPath()
   body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>IAQ and CO2</h2><canvas id='graphsAir' height='90'></canvas></div></div>";
   body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>Particulate Matter</h2><canvas id='graphsPm' height='90'></canvas></div></div>";
   body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>HV, Luminosity, HCHO &amp; VOC</h2><canvas id='graphsEnv' height='90'></canvas></div></div>";
+  if (activeDualTubeEnabled && activeCoincEnabled)
+  {
+    body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>Tube Coincidences (muon candidates per minute)</h2><canvas id='graphsCoinc' height='90'></canvas></div></div>";
+    body += "<script>window.addEventListener('load',function(){fetch('/history.csv',{cache:'no-store'}).then(function(r){return r.text();}).then(function(t){const rows=t.trim().split(/\\r?\\n/).slice(1).map(function(l){return l.split(',');}).filter(function(c){return c.length>=17&&c[16]!=='';});const el=document.getElementById('graphsCoinc');if(!rows.length||!window.Chart){el.closest('.card').style.display='none';return;}const txt=getComputedStyle(document.body).getPropertyValue('--text').trim()||'#e0e0e0';new Chart(el,{type:'line',data:{labels:rows.map(function(c){return new Date(Number(c[0])*1000).toLocaleString();}),datasets:[{label:'Coincidences / min',data:rows.map(function(c){return Number(c[16]);}),borderColor:'#26c6da',pointRadius:0,borderWidth:2,tension:.22}]},options:{responsive:true,animation:false,scales:{x:{ticks:{color:txt,maxTicksLimit:10}},y:{beginAtZero:true,ticks:{color:txt}}},plugins:{legend:{labels:{color:txt}}}}});}).catch(function(){});});</script>";
+  }
     body += "<script>window.cfgEnabled=" + buildExpEnabledJson() + ";</script>";
     body += "<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js'></script>";
     body += "<script>(function(){"
@@ -4070,6 +4135,7 @@ void handleOtaCheckPath()
   body += "<div class='col-md-6'><div class='border rounded-3 p-3 h-100'><div class='fw-semibold mb-2'>Firmware OTA</div><div class='hint'>Current running OTA slot: <span class='mono'>" + describePartitionSlot(runningPartition) + "</span><br>Next update slot: <span class='mono'>" + describePartitionSlot(nextPartition) + "</span></div></div></div>";
   body += "<div class='col-md-6'><div class='border rounded-3 p-3 h-100'><div class='fw-semibold mb-2'>Filesystem</div><div class='hint'>SPIFFS total: " + String(totalFsBytes) + " bytes<br>SPIFFS free: " + String(freeFsBytes) + " bytes<br>SPIFFS used: " + String((freeFsBytes <= totalFsBytes) ? (totalFsBytes - freeFsBytes) : 0U) + " bytes</div></div></div>";
   body += "</div><div class='alert alert-secondary mt-3 mb-0'>If <span class='mono'>/update</span> returns 404 while this page loads, verify the installed ElegantOTA library version and reflash this exact sketch.</div></div></div>";
+  body += "<div class='card mt-4'><div class='card-body'><h2 class='h5 mb-3'>SPIFFS File Listing</h2>" + buildSpiffsDirectoryHtml() + "</div></div>";
 
   server.send(200, "text/html; charset=utf-8", adminPageShell("OTA Status", "Validate firmware slots, app headroom, and SPIFFS state from the running device.", body));
 }
@@ -4584,6 +4650,7 @@ static bool appendHistorySample(time_t sampleEpoch)
   addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV), tubeVoltageX10);
   addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_ILLUMINANCE), (long)luminosity);
   addField(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CH2O), hchoPpb);
+  addField(activeDualTubeEnabled && activeCoincEnabled, (long)coincPerMin);
   line += '\n';
 
   historyFile.print(line);
@@ -4849,6 +4916,13 @@ std::vector<String> webPageChunks(bool admin)
       "<div class='card-title'>Tube 2 CPM</div>"
       "<div id='cpm2Value' class='card-value'>" + String(cpm2) + "</div>"
       "<div class='card-unit'>counts per minute</div>"
+    "</div>"
+    // Coincidences
+    + "<div class='card' id='coincCard'" + String((activeDualTubeEnabled && activeCoincEnabled) ? "" : " style='display:none'") + ">"
+      "<div class='card-title'>Tube Coincidences (muon candidates)</div>"
+      "<div id='coincValue' class='card-value'>" + String(coincPerMin) + "</div>"
+      "<div class='card-unit'>per minute (last 60 s)</div>"
+      "<div id='coincInfo' class='card-detail' style='margin-top:6px;font-size:.72rem;color:var(--muted);'>accidental est. " + String(coincAccidentalPerMin, 2) + " / min</div>"
     "</div>"
     // HV
     + "<div class='card'>"
@@ -5256,6 +5330,8 @@ std::vector<String> webPageChunks(bool admin)
     + "  setText('cpm1Value',String(Math.round(Number(d.cpm1)||0)));"
     + "  setText('cpm2Value',String(Math.round(Number(d.cpm2)||0)));"
     + "  if(!dualTubeEnabled){if(byId('cpm2Value')) byId('cpm2Value').textContent='0';}"
+    + "  const coincCard=byId('coincCard');"
+    + "  if(coincCard){coincCard.style.display=d.coincEnabled?'':'none';setText('coincValue',String(Math.round(Number(d.coincPerMin)||0)));setText('coincInfo','accidental est. '+(Number(d.coincAccidentalPerMin)||0).toFixed(2)+' / min');}"
     + "  setText('hvValue',hv.toFixed(1));"
     + "  byId('hvGauge').style.width=clamp(Math.round(hv*100/500),0,100)+'%';"
     + "  byId('hvGauge').style.background=hvColor(hv);"
@@ -5391,6 +5467,9 @@ String JsonPage(bool admin)
   doc["tubeVoltage"] = tubeVoltage;
   doc["estimatedHvDrivePct"] = estimateHvDrivePct(tubeVoltage);
   doc["dualTubeEnabled"] = activeDualTubeEnabled;
+  doc["coincEnabled"] = (activeDualTubeEnabled && activeCoincEnabled);
+  doc["coincPerMin"] = coincPerMin;
+  doc["coincAccidentalPerMin"] = coincAccidentalPerMin;
   doc["tubePresetId"] = activeTubePresetId;
   doc["tubePresetLabel"] = activeTubePresetLabel;
   doc["tubeDeadTimeUs"] = activeTubeDeadTimeSeconds * 1000000.0f;
