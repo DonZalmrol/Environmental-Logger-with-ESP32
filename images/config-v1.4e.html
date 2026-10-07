@@ -70,10 +70,12 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
   <nav class="menu">
     <a class="menu-link" href="dashboard.html">Dashboard</a>
     <a class="menu-link" href="graphs.html">Graphs</a>
+    <a class="menu-link" href="admin.html">Admin</a>
     <a class="menu-link active" href="#">Config</a>
     <a class="menu-link" href="#">OTA Check</a>
     <a class="menu-link" href="#">OTA Update</a>
     <a class="menu-link" href="#">JSON</a>
+    <a class="menu-link" href="dashboard.html">Logout</a>
     <div class="theme-picker">
       <label for="themeSelect">Theme</label>
       <select id="themeSelect"><option value="dark">Dark</option><option value="light">Light</option></select>
@@ -127,6 +129,11 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
             <div class="form-text">Leave blank to keep the current password.</div>
           </div>
           <div class="col-md-6">
+            <label class="form-label">CPM Source</label>
+            <select class="form-select" id="radmon_src"><option value="t1_raw">Tube 1 raw</option><option value="t1_avg">Tube 1 moving average</option><option value="t2_raw">Tube 2 raw</option><option value="t2_avg">Tube 2 moving average</option><option value="c_raw">Tube 1+2 combined raw</option><option value="c_avg" selected>Tube 1+2 combined moving average</option></select>
+            <div class="form-text">Which CPM value is uploaded.</div>
+          </div>
+          <div class="col-md-6">
             <label class="form-label">Hostname</label>
             <input class="form-control" value="envlogger">
           </div>
@@ -140,47 +147,6 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
                 <a class="btn btn-outline-primary" href="#">Open WiFi Scanner</a>
               </div>
             </div>
-          </div>
-
-          <!-- radmon.org -->
-          <div class="col-12 pt-2"><h3 id="cfgSec2" style="scroll-margin-top:16px" class="h6 text-uppercase text-body-secondary mb-1">radmon.org</h3></div>
-          <div class="col-12">
-            <div class="form-check form-switch">
-              <input class="form-check-input" type="checkbox" id="radmon_en" checked>
-              <label class="form-check-label" for="radmon_en">Enable Radmon uploads</label>
-              <div class="form-text">When disabled, the device keeps sampling normally but skips Radmon submissions.</div>
-            </div>
-          </div>
-          <div class="col-md-6">
-            <label class="form-label">User Name</label>
-            <input class="form-control" value="my_radmon_user">
-          </div>
-          <div class="col-md-6">
-            <label class="form-label">Password</label>
-            <input class="form-control" type="password" placeholder="Stored value masked">
-            <div class="form-text">Leave blank to keep the current password.</div>
-          </div>
-
-          <!-- uRADMonitor -->
-          <div class="col-12 pt-2"><h3 id="cfgSec3" style="scroll-margin-top:16px" class="h6 text-uppercase text-body-secondary mb-1">uRADMonitor</h3></div>
-          <div class="col-12">
-            <div class="form-check form-switch">
-              <input class="form-check-input" type="checkbox" id="urad_en" checked>
-              <label class="form-check-label" for="urad_en">Enable uRADMonitor uploads</label>
-              <div class="form-text">When disabled, the device keeps local logging and web features active but skips uRADMonitor submissions.</div>
-            </div>
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">User ID</label>
-            <input class="form-control" value="123456">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">User Key</label>
-            <input class="form-control" type="password" placeholder="Stored value masked">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">Device ID</label>
-            <input class="form-control" value="654321">
           </div>
 
           <!-- Time -->
@@ -318,40 +284,33 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
               <div class="fw-semibold mb-2">Enable EXP sensor fields</div>
               <div class="row g-4">
                 <div class="col-12">
-                  <div class="small text-uppercase text-body-secondary mb-2">Environmental fields</div>
                   <div class="row row-cols-1 row-cols-md-2 g-2">
                     <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e01" checked disabled><label class="form-check-label" for="e01">Timestamp (01) &mdash; mandatory</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e02" checked><label class="form-check-label" for="e02">Temperature (02)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e03" checked><label class="form-check-label" for="e03">Pressure (03)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e04" checked><label class="form-check-label" for="e04">Humidity (04)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e05" checked><label class="form-check-label" for="e05">Illuminance (05)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e06" checked><label class="form-check-label" for="e06">VOC (06)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e07" checked><label class="form-check-label" for="e07">CO2 (07)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e08" checked><label class="form-check-label" for="e08">Formaldehyde (08)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e09" checked><label class="form-check-label" for="e09">PM2.5 (09)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e12" checked><label class="form-check-label" for="e12">PM1.0 (12)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e13" checked><label class="form-check-label" for="e13">PM10 (13)</label></div></div></div>
-                  </div>
-                </div>
-                <div class="col-12">
-                  <div class="small text-uppercase text-body-secondary mb-2">Radiation and device fields</div>
-                  <div class="row row-cols-1 row-cols-md-2 g-2">
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0b" checked><label class="form-check-label" for="e0b">CPM (0B)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0c" checked><label class="form-check-label" for="e0c">HV voltage (0C)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0d" checked><label class="form-check-label" for="e0d">HV drive (0D)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e10" checked><label class="form-check-label" for="e10">Tube type (10)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0e"><label class="form-check-label" for="e0e">Hardware version (0E)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0f"><label class="form-check-label" for="e0f">Firmware version (0F)</label></div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e1a" checked><label class="form-check-label" for="e1a">WiFi signal (1A)</label></div></div></div>
-                  </div>
-                </div>
-                <div class="col-12">
-                  <div class="small text-uppercase text-body-secondary mb-2">Extra inputs (need a pin and scale/offset)</div>
-                  <div class="row row-cols-1 row-cols-md-2 g-2">
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="x0a" disabled><label class="form-check-label" for="x0a">Battery (0A)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="x14" disabled><label class="form-check-label" for="x14">Noise</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="x15" disabled><label class="form-check-label" for="x15">Ozone</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
-                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="x16" disabled><label class="form-check-label" for="x16">Radon</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e02" checked><label class="form-check-label" for="e02">Temperature (02)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e03" checked><label class="form-check-label" for="e03">Pressure (03)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e04" checked><label class="form-check-label" for="e04">Humidity (04)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e05" checked><label class="form-check-label" for="e05">Illuminance / lux (05)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e06" checked><label class="form-check-label" for="e06">VOC (06)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e07" checked><label class="form-check-label" for="e07">CO2 (07)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e08" checked><label class="form-check-label" for="e08">CH2O / HCHO (08)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO34</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e09" checked><label class="form-check-label" for="e09">PM2.5 (09)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0a" disabled><label class="form-check-label" for="e0a">Battery voltage (0A)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0b" checked><label class="form-check-label" for="e0b">Tube 1 CPM (0B)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO13</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0c" checked><label class="form-check-label" for="e0c">Tube voltage (0C)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO33</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0d" checked><label class="form-check-label" for="e0d">HV duty cycle (0D)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO33</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0e" ><label class="form-check-label" for="e0e">Hardware version (0E)</label></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e0f" ><label class="form-check-label" for="e0f">Firmware version (0F)</label></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e10" checked><label class="form-check-label" for="e10">Tube type ID (10)</label></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e11" disabled><label class="form-check-label" for="e11">Noise level (11)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e12" checked><label class="form-check-label" for="e12">PM1.0 (12)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e13" checked><label class="form-check-label" for="e13">PM10 (13)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-secondary btn-sm">Configure</button><span class="form-text exp-sensor-summary">GPIO21 / GPIO22</span></div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e14" disabled><label class="form-check-label" for="e14">Ozone (14)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e15" disabled><label class="form-check-label" for="e15">Radon (15)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e16" disabled><label class="form-check-label" for="e16">Wind speed (16)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e17" disabled><label class="form-check-label" for="e17">Wind direction (17)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e18" disabled><label class="form-check-label" for="e18">Rain accumulation (18)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e19" disabled><label class="form-check-label" for="e19">Irradiance (19)</label></div><div class="exp-sensor-actions"><button type="button" class="btn btn-outline-primary btn-sm">Configure</button></div><div class="exp-sensor-summary hint">Pin and calibration not configured</div></div></div>
+                    <div class="col"><div class="exp-sensor-control"><div class="form-check"><input class="form-check-input" type="checkbox" id="e1a" checked><label class="form-check-label" for="e1a">Wi-Fi signal (1A, dBm)</label></div></div></div>
                   </div>
                 </div>
               </div>
@@ -377,6 +336,52 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
             </div>
           </div>
 
+          <!-- radmon.org -->
+          <div class="col-12 pt-2"><h3 id="cfgSec2" style="scroll-margin-top:16px" class="h6 text-uppercase text-body-secondary mb-1">radmon.org</h3></div>
+          <div class="col-12">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="radmon_en" checked>
+              <label class="form-check-label" for="radmon_en">Enable Radmon uploads</label>
+              <div class="form-text">When disabled, the device keeps sampling normally but skips Radmon submissions.</div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">User Name</label>
+            <input class="form-control" value="my_radmon_user">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Password</label>
+            <input class="form-control" type="password" placeholder="Stored value masked">
+            <div class="form-text">Leave blank to keep the current password.</div>
+          </div>
+
+          <!-- uRADMonitor -->
+          <div class="col-12 pt-2"><h3 id="cfgSec3" style="scroll-margin-top:16px" class="h6 text-uppercase text-body-secondary mb-1">uRADMonitor</h3></div>
+          <div class="col-12">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="urad_en" checked>
+              <label class="form-check-label" for="urad_en">Enable uRADMonitor uploads</label>
+              <div class="form-text">When disabled, the device keeps local logging and web features active but skips uRADMonitor submissions.</div>
+            </div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">User ID</label>
+            <input class="form-control" value="123456">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">User Key</label>
+            <input class="form-control" type="password" placeholder="Stored value masked">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Device ID</label>
+            <input class="form-control" value="654321">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">CPM Source</label>
+            <select class="form-select" id="urad_src"><option value="t1_raw">Tube 1 raw</option><option value="t1_avg" selected>Tube 1 moving average</option><option value="t2_raw">Tube 2 raw</option><option value="t2_avg">Tube 2 moving average</option><option value="c_raw">Tube 1+2 combined raw</option><option value="c_avg">Tube 1+2 combined moving average</option></select>
+            <div class="form-text">Which CPM value is uploaded.</div>
+          </div>
+
           <!-- Buttons -->
           <div class="col-12 d-flex flex-wrap gap-2 pt-2 cfg-actions">
             <button type="button" class="btn btn-primary">Save Settings</button>
@@ -398,8 +403,6 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
 <div class="d-flex flex-wrap gap-1 mb-3">
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec0">General</a>
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec1">WiFi</a>
-<a class="btn btn-sm btn-outline-secondary" href="#cfgSec2">radmon.org</a>
-<a class="btn btn-sm btn-outline-secondary" href="#cfgSec3">uRADMonitor</a>
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec4">Time and Region</a>
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec5">Diagnostics</a>
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec6">Logging and Display</a>
@@ -407,6 +410,8 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec8">GPIO Mapping</a>
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec9">EXP Sensor Selection</a>
 <a class="btn btn-sm btn-outline-secondary" href="#cfgSec10">Calibration</a>
+<a class="btn btn-sm btn-outline-secondary" href="#cfgSec2">radmon.org</a>
+<a class="btn btn-sm btn-outline-secondary" href="#cfgSec3">uRADMonitor</a>
 </div><hr>
         <h2 class="h5 mb-3">Notes</h2>
         <ul class="mb-0 ps-3 hint">
@@ -417,6 +422,7 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
           <li>Tube presets live in <span class="mono">logger_user_config.h</span> so builders can ship cleaner defaults.</li>
           <li>The compiled <span class="mono">arduino_secrets.h</span> values remain as fallback defaults.</li>
           <li>The OTA update page is still served by the ElegantOTA library.</li>
+          <li>This page, OTA status and the admin dashboard require the admin login; use Logout in the menu to end the session.</li>
         </ul>
       </div>
     </div>

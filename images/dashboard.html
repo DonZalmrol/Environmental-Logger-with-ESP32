@@ -53,6 +53,7 @@ a{color:var(--accent);}
   <nav class="menu">
     <a class="menu-link active" href="#">Dashboard</a>
     <a class="menu-link" href="graphs.html">Graphs</a>
+    <a class="menu-link" href="admin.html">Admin</a>
     <a class="menu-link" href="config.html">Config</a>
     <div class="theme-picker">
       <label for="themeSelect">Theme</label>
@@ -64,7 +65,7 @@ a{color:var(--accent);}
 <!-- HERO -->
 <section class="hero">
   <h1>Station Dashboard</h1>
-  <p class="hero-lead">Live environmental, radiation, storage, and upload telemetry from the ESP32 station.</p>
+  <p class="hero-lead">Live environmental and radiation telemetry from the ESP32 station.</p>
   <div class="hero-meta">
     <span class="hero-chip">2026-04-19  |  14:32:07</span>
     <span class="hero-chip">cycle 47 / 60</span>
@@ -190,55 +191,6 @@ a{color:var(--accent);}
       <div class="card-title">Luminosity</div>
       <div class="card-value">47</div>
       <div class="card-unit">lux</div>
-    </div>
-  </div>
-</section>
-
-<!-- RESOURCES -->
-<section>
-  <h2>&#9881; Resources</h2>
-  <div class="grid">
-    <div class="card">
-      <div class="card-title">CPU Core 0</div>
-      <div class="card-value">12.4</div>
-      <div class="card-unit">% busy</div>
-    </div>
-    <div class="card">
-      <div class="card-title">CPU Core 1</div>
-      <div class="card-value">3.1</div>
-      <div class="card-unit">% busy</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Free Heap</div>
-      <div class="card-value">229.4</div>
-      <div class="card-unit">229.4 / 327.7 kB (70.0% free)</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Disk Space</div>
-      <div class="card-value">148.0</div>
-      <div class="card-unit">148.0 / 192.0 kB (77.1% free)</div>
-    </div>
-    <div class="card">
-      <div class="card-title">WiFi</div>
-      <div class="card-value">-61 dBm</div>
-      <div class="card-unit">connected</div>
-    </div>
-  </div>
-</section>
-
-<!-- UPLOAD STATUS -->
-<section>
-  <h2>&#8679; Upload Status</h2>
-  <div class="grid">
-    <div class="card">
-      <div class="card-title">radmon.org</div>
-      <div class="card-value" style="font-size:1.1rem"><span class="badge badge-ok">HTTP 200</span></div>
-      <div class="card-unit" style="margin-top:6px">CPM: 18 &nbsp;|&nbsp; 14:31:07</div>
-    </div>
-    <div class="card">
-      <div class="card-title">uRADMonitor</div>
-      <div class="card-value" style="font-size:1.1rem"><span class="badge badge-ok">HTTP 200</span></div>
-      <div class="card-unit" style="margin-top:6px">CPM: 18 &nbsp;|&nbsp; 14:31:07</div>
     </div>
   </div>
 </section>

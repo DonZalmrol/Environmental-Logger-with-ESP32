@@ -54,6 +54,7 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
   <nav class="menu">
     <a class="menu-link" href="dashboard.html">Dashboard</a>
     <a class="menu-link active" href="#">Graphs</a>
+    <a class="menu-link" href="admin.html">Admin</a>
     <a class="menu-link" href="config.html">Config</a>
     <div class="theme-picker">
       <label for="themeSelect">Theme</label>
@@ -69,8 +70,6 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
       <h1>Graphs</h1>
       <p>Historical CSV graphs stored locally on SPIFFS.</p>
       <div class="hero-meta">
-        <span class="hero-chip">Device IP <span class="mono">192.168.1.42</span></span>
-        <span class="hero-chip">Hostname <span class="mono">envlogger</span></span>
         <span class="hero-chip"><span class="mono">uptime 3 days, 07:14</span></span>
       </div>
     </div>
@@ -98,13 +97,6 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
           <button class="btn btn-primary">Reload History</button>
           <a class="btn btn-outline-secondary" href="#">Download CSV</a>
           <a class="btn btn-outline-secondary" href="dashboard.html">Back to Dashboard</a>
-        </div>
-        <div class="mt-4">
-          <h3 class="h6 mb-3" style="color:var(--text)">SPIFFS File Listing</h3>
-          <table>
-            <tr><th>File</th><th>Size</th></tr>
-            <tr><td><span class="mono">/history_recent.csv</span></td><td>43 218 B</td></tr>
-          </table>
         </div>
       </div>
     </div>

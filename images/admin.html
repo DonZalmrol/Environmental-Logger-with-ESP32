@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>envlogger : Environmental Logger — Admin Preview</title>
+
+<style>
+:root{--bg:#10161d;--bg-soft:#17212b;--card:#1c2733;--border:#334456;--text:#f3f7fb;--muted:#c5d1dd;--accent:#58a6ff;--accent-strong:#3d8bfd;--tableHead:#1b2833;--tableRow:#16202a;--chip:#1a2834;--gaugeBg:#314151;--shadow:rgba(0,0,0,.28);--heroA:#17324a;--heroB:#245e86;--surface:rgba(255,255,255,.08);color-scheme:dark;}
+body[data-theme="light"]{--bg:#eff4f8;--bg-soft:#f7fafc;--card:#ffffff;--border:#d4dee8;--text:#17212b;--muted:#5d6d7d;--accent:#1e6bd6;--accent-strong:#1451a8;--tableHead:#e5eef6;--tableRow:#f8fbfd;--chip:#eef3f7;--gaugeBg:#d8e1ea;--shadow:rgba(22,41,66,.12);--heroA:#ddebf7;--heroB:#f7fbff;--surface:rgba(255,255,255,.72);color-scheme:light;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:radial-gradient(circle at top,var(--heroA),var(--bg) 38%);color:var(--text);font-family:Segoe UI,Arial,sans-serif;}
+.page-shell{max-width:1240px;margin:0 auto;padding:20px 16px 28px;}
+.topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:12px 14px;border:1px solid var(--border);border-radius:18px;background:var(--surface);backdrop-filter:blur(12px);box-shadow:0 12px 28px var(--shadow);}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.02em;color:var(--text);}
+.brand-mark{width:34px;height:34px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;font-size:1rem;box-shadow:0 8px 18px rgba(33,109,214,.28);}
+.menu{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
+.menu-link{border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--text);text-decoration:none;padding:8px 12px;font-size:.84rem;font-weight:600;box-shadow:0 8px 20px var(--shadow);}
+.menu-link.active{background:linear-gradient(135deg,var(--accent),var(--accent-strong));color:#fff;border-color:transparent;}
+.hero{padding:24px;border:1px solid var(--border);border-radius:24px;background:linear-gradient(135deg,var(--surface),rgba(255,255,255,.02)),linear-gradient(135deg,var(--heroA),var(--heroB));box-shadow:0 20px 40px var(--shadow);margin-bottom:18px;}
+.hero h1{text-align:left;color:var(--text);margin-bottom:6px;font-size:clamp(1.7rem,3vw,2.5rem);}
+.hero-lead{color:var(--muted);font-size:.92rem;margin-bottom:10px;}
+.hero-meta{display:flex;flex-wrap:wrap;gap:8px;}
+.hero-chip{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:var(--chip);font-size:.82rem;color:var(--text);}
+.theme-picker{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:8px 12px;box-shadow:0 6px 18px var(--shadow);}
+.theme-picker label{font-size:.8rem;color:var(--muted);font-weight:700;letter-spacing:.04em;text-transform:uppercase;}
+.theme-picker select{background:var(--bg-soft);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:6px 10px;font:inherit;outline:none;}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-bottom:20px;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:14px;box-shadow:0 16px 34px var(--shadow);}
+.card-title{font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;}
+.card-value{font-size:2rem;font-weight:700;line-height:1;}
+.card-unit{font-size:.8rem;color:var(--muted);margin-top:2px;}
+.gauge-bg{background:var(--gaugeBg);border-radius:4px;height:8px;margin-top:10px;overflow:hidden;}
+.gauge-fill{height:100%;border-radius:4px;transition:width .4s;}
+.chart-card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:14px;margin-bottom:14px;box-shadow:0 16px 34px var(--shadow);}
+.chart-card h3{font-size:.85rem;color:var(--muted);margin-bottom:10px;}
+section{margin-bottom:20px;}
+h2{color:var(--accent);font-size:1rem;margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:4px;}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72rem;font-weight:700;}
+.badge-ok{background:#1b5e20;color:#a5d6a7;}
+.badge-err{background:#b71c1c;color:#ef9a9a;}
+.badge-neutral{background:#37474f;color:#cfd8dc;}
+footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted);border-top:1px solid var(--border);margin-top:28px;}
+a{color:var(--accent);}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);font-size:.86rem;}
+th{background:var(--tableHead);color:var(--muted);text-transform:uppercase;font-size:.72rem;letter-spacing:.05em;}
+.wifi-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px;font-size:.72rem;color:var(--muted);margin-top:10px;}
+.wifi-details span{background:var(--chip);border:1px solid var(--border);border-radius:6px;padding:6px 8px;}
+.wifi-icon{display:flex;align-items:flex-end;gap:3px;height:24px;margin-bottom:8px;}
+.wifi-bar{width:5px;border-radius:999px;background:var(--accent);}
+.wifi-bar:nth-child(1){height:7px;}.wifi-bar:nth-child(2){height:12px;}.wifi-bar:nth-child(3){height:17px;}.wifi-bar:nth-child(4){height:22px;}
+.status-meta{display:block;font-size:.72rem;color:var(--muted);margin-top:4px;}</style>
+</head>
+<body>
+<main class="page-shell">
+
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">&#9762;</span><span>Environmental Logger</span></div>
+  <nav class="menu">
+    <a class="menu-link" href="dashboard.html">Dashboard</a>
+    <a class="menu-link" href="graphs.html">Graphs</a>
+    <a class="menu-link active" href="#">Admin</a>
+    <a class="menu-link" href="config.html">Config</a>
+    <a class="menu-link" href="dashboard.html">Logout</a>
+    <div class="theme-picker">
+      <label for="themeSelect">Theme</label>
+      <select id="themeSelect"><option value="dark">Dark</option><option value="light">Light</option></select>
+    </div>
+  </nav>
+</header>
+
+<section class="hero">
+  <h1>Station Dashboard</h1>
+  <p class="hero-lead">Device resources, network and upload status (admin only).</p>
+  <div class="hero-meta">
+    <span class="hero-chip">2026-04-19  |  14:32:07</span>
+    <span class="hero-chip">cycle 47 / 60</span>
+    <span class="hero-chip">uptime 3 days, 07:14</span>
+  </div>
+</section>
+
+<section>
+  <h2>&#9881; Resources</h2>
+  <div class="grid">
+    <div class="card"><div class="card-title">CPU Core 0</div><div class="card-value">12.4</div><div class="card-unit">% busy</div></div>
+    <div class="card"><div class="card-title">CPU Core 1</div><div class="card-value">3.1</div><div class="card-unit">% busy</div></div>
+    <div class="card"><div class="card-title">Loop Active</div><div class="card-value">8.7</div><div class="card-unit">% of Core 0 loop task time</div></div>
+    <div class="card"><div class="card-title">Free Heap</div><div class="card-value">229.4</div><div class="card-unit">229.4 / 327.7 kB (70.0% free)</div></div>
+    <div class="card"><div class="card-title">App Partition</div><div class="card-value">494.4</div><div class="card-unit">494.4 / 1920.0 kB (25.7% free)</div></div>
+    <div class="card"><div class="card-title">Disk Space</div><div class="card-value">148.0</div><div class="card-unit">148.0 / 192.0 kB (77.1% free)</div></div>
+    <div class="card">
+      <div class="card-title">WiFi</div>
+      <div class="wifi-icon"><span class="wifi-bar"></span><span class="wifi-bar"></span><span class="wifi-bar"></span><span class="wifi-bar"></span></div>
+      <div class="card-value">-61 dBm</div>
+      <div class="card-unit">connected</div>
+      <div class="wifi-details">
+        <span>SSID: HomeNetwork</span><span>RSSI: -61 dBm</span><span>Signal: 78%</span>
+        <span>IP: 192.168.1.42</span><span>Gateway: 192.168.1.1</span><span>MAC: AA:BB:CC:DD:EE:FF</span>
+      </div>
+    </div>
+    <div class="card"><div class="card-title">I2C Devices</div><div class="card-value">3</div><div class="card-unit">found on bus</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>&#9652; Uploads</h2>
+  <table>
+    <tr><th>Platform</th><th>Status</th><th>Dashboard</th></tr>
+    <tr>
+      <td>Radmon</td>
+      <td><span class="badge badge-ok">OK</span><span class="status-meta">Last upload: 2026-04-19 14:31 &nbsp;|&nbsp; CPM 18 &nbsp;|&nbsp; Dose 0.0270 &micro;Sv/h</span></td>
+      <td><a href="#">radmon.org</a></td>
+    </tr>
+    <tr>
+      <td>uRADMonitor</td>
+      <td><span class="badge badge-ok">OK</span><span class="status-meta">Last upload: 2026-04-19 14:31 &nbsp;|&nbsp; CPM 18 &nbsp;|&nbsp; HV 392.3 V</span></td>
+      <td><a href="#">uradmonitor.com</a></td>
+    </tr>
+  </table>
+</section>
+
+<footer>&copy; 2022&ndash;2026 &middot; By <a href="https://www.don-zalmrol.be/" target="_blank" rel="noopener">Don Zalmrol</a> &middot; <a href="https://github.com/DonZalmrol" target="_blank" rel="noopener">GitHub</a> &middot; <span style="font-family:monospace">v1.4e</span></footer>
+</main>
+<script>
+var sel=document.getElementById('themeSelect');
+sel.addEventListener('change',function(){document.body.setAttribute('data-theme',sel.value);});
+</script>
+</body>
+</html>
