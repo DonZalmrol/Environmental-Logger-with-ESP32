@@ -110,6 +110,7 @@
 #include <ArduinoJson.h>
 //#include <esp32/clk.h>
 #include <vector>
+#include <algorithm>
 
 //#include <Digital_Light_TSL2561.h>
 #include "src/Digital_Light_TSL2561.h"
@@ -261,6 +262,8 @@ struct StateSnapshot {
 struct UploadSnapshot {
   unsigned long cpm;
   unsigned long cpm1;
+  unsigned long cpmRadmon;
+  unsigned long cpmURad;
   unsigned long actual_cps_1;
   unsigned long actual_cps_2;
   float tubeVoltage;
@@ -348,6 +351,7 @@ static String uploadStatusText(int code);
 static float estimateHvDrivePct(float voltage);
 static float estimateHvDriveUploadPct(float voltage);
 static float movingAvgToCpm(movingAvg &avg);
+static unsigned long selectUploadCpm(const String &source);
 static unsigned long applyDeadTimeCorrection(int rawCps, float deadTimeSeconds, const char *tubeLabel);
 static void refreshCpuLoadMetrics(void);
 static bool checkEspOk(const char *operation, esp_err_t errorCode);
@@ -373,6 +377,7 @@ static bool appendHistorySample(time_t sampleEpoch);
 static void pruneHistoryLogIfNeeded(void);
 static size_t countHistoryRows(void);
 static void loadRuntimeSettings(void);
+static void handleHealthPath(void);
 static void configureTimeRules(void);
 static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass);
 static void saveRuntimeSetting(Preferences &prefs, const char *key, const String &value);
@@ -408,8 +413,11 @@ void handleWifiScanPagePath();
 void handleGraphsPath();
 void handleHistoryCsvPath();
 void handleHistoryDeletePath();
-std::vector<String> webPageChunks(void);
-String JsonPage(void);
+std::vector<String> webPageChunks(bool admin);
+String JsonPage(bool admin);
+void handleAdminPath();
+void handleAdminJsonPath();
+void handleLogoutPath();
 
 #define VERBOSE_SERIAL_PRINT(...) do { if (serialVerboseEnabled) { Serial.print(__VA_ARGS__); } } while (0)
 #define VERBOSE_SERIAL_PRINTLN(...) do { if (serialVerboseEnabled) { Serial.println(__VA_ARGS__); } } while (0)
@@ -534,6 +542,43 @@ float activeHchoR0 = DEFAULT_HCHO_R0;
 size_t activeHistoryRetentionSamples = DEFAULT_HISTORY_RETENTION_SAMPLES;
 bool activeRadmonUploadEnabled = true;
 bool activeURadmonUploadEnabled = true;
+
+// Selectable CPM source for uploads. "raw" = last 1 s dead-time-corrected CPS x 60; "avg" = moving-average CPM.
+struct CpmSourceOption { const char *id; const char *label; };
+static const CpmSourceOption CPM_SOURCE_OPTIONS[] = {
+  {"t1_raw", "Tube 1 raw"},
+  {"t1_avg", "Tube 1 moving average"},
+  {"t2_raw", "Tube 2 raw"},
+  {"t2_avg", "Tube 2 moving average"},
+  {"c_raw",  "Tube 1 + 2 combined raw"},
+  {"c_avg",  "Tube 1 + 2 combined moving average"}
+};
+static const size_t CPM_SOURCE_COUNT = sizeof(CPM_SOURCE_OPTIONS) / sizeof(CPM_SOURCE_OPTIONS[0]);
+#define DEFAULT_RADMON_CPM_SOURCE "c_avg"
+#define DEFAULT_URAD_CPM_SOURCE "t1_avg"
+String activeRadmonCpmSource = String(DEFAULT_RADMON_CPM_SOURCE);
+String activeURadmonCpmSource = String(DEFAULT_URAD_CPM_SOURCE);
+
+static String normalizeCpmSource(const String &id, const char *fallback)
+{
+  for (size_t i = 0; i < CPM_SOURCE_COUNT; ++i)
+  {
+    if (id == CPM_SOURCE_OPTIONS[i].id) return id;
+  }
+  return String(fallback);
+}
+
+static String buildCpmSourceSelectHtml(const char *name, const String &selected)
+{
+  String html = "<div class='col-md-6'><label class='form-label' for='" + String(name) + "'>CPM source</label><select class='form-select' id='" + String(name) + "' name='" + String(name) + "'>";
+  for (size_t i = 0; i < CPM_SOURCE_COUNT; ++i)
+  {
+    html += "<option value='" + String(CPM_SOURCE_OPTIONS[i].id) + "'" + (selected == CPM_SOURCE_OPTIONS[i].id ? " selected" : "") + ">" + CPM_SOURCE_OPTIONS[i].label + "</option>";
+  }
+  html += "</select><div class='form-text'>Raw uses the latest 1 s count x 60; moving average uses the rolling window. Tube 2 / combined options need dual tube enabled.</div></div>";
+  return html;
+}
+
 String activeNtpServer = String(DEFAULT_NTP_SERVER);
 long activeCpmGaugeFullScale = DEFAULT_CPM_GAUGE_FULL_SCALE;
 String activeStationName = String(DEFAULT_STATION_NAME);
@@ -1072,6 +1117,8 @@ void loop()
         {
           snap->cpm             = cpm;
           snap->cpm1            = cpm1;
+          snap->cpmRadmon       = selectUploadCpm(activeRadmonCpmSource);
+          snap->cpmURad         = selectUploadCpm(activeURadmonCpmSource);
           snap->actual_cps_1    = actual_cps_1;
           snap->actual_cps_2    = actual_cps_2;
           snap->tubeVoltage     = tubeVoltage;
@@ -1200,6 +1247,10 @@ static void WiFiSetup(void)
 
   server.on("/", handleRootPath);
   server.on("/json", handleJsonPath);
+  server.on("/admin", HTTP_GET, handleAdminPath);
+  server.on("/admin/json", HTTP_GET, handleAdminJsonPath);
+  server.on("/logout", HTTP_ANY, handleLogoutPath);
+  server.on("/health", HTTP_ANY, handleHealthPath);
   server.on("/config", HTTP_GET, handleConfigPath);
   server.on("/config", HTTP_POST, handleConfigPath);
   server.on("/reboot", HTTP_POST, handleRebootPath);
@@ -1218,6 +1269,8 @@ static void WiFiSetup(void)
   {
     Serial.println(F("WARNING: SECRET_ADMIN_PASS not set; /config, /update and admin actions are unauthenticated."));
   }
+  static const char *csrfHeaders[] = {"Origin", "Referer", "Host", "X-Forwarded-Host"};
+  server.collectHeaders(csrfHeaders, sizeof(csrfHeaders) / sizeof(csrfHeaders[0]));
   ElegantOTA.begin(&server);
   server.begin();
   Serial.println(F("Server listening"));
@@ -1259,6 +1312,8 @@ static void loadRuntimeSettings(void)
     activeHistoryRetentionSamples = DEFAULT_HISTORY_RETENTION_SAMPLES;
     activeRadmonUploadEnabled = true;
     activeURadmonUploadEnabled = true;
+    activeRadmonCpmSource = String(DEFAULT_RADMON_CPM_SOURCE);
+    activeURadmonCpmSource = String(DEFAULT_URAD_CPM_SOURCE);
     activeNtpServer = String(DEFAULT_NTP_SERVER);
     activeCpmGaugeFullScale = DEFAULT_CPM_GAUGE_FULL_SCALE;
     activeStationName = String(DEFAULT_STATION_NAME);
@@ -1313,6 +1368,8 @@ static void loadRuntimeSettings(void)
   activeHistoryRetentionSamples = (size_t)settingsStore.getInt("hist_keep", (int)DEFAULT_HISTORY_RETENTION_SAMPLES);
   activeRadmonUploadEnabled = settingsStore.getBool("rad_en", true);
   activeURadmonUploadEnabled = settingsStore.getBool("urad_en", true);
+  activeRadmonCpmSource = normalizeCpmSource(settingsStore.getString("rad_src", DEFAULT_RADMON_CPM_SOURCE), DEFAULT_RADMON_CPM_SOURCE);
+  activeURadmonCpmSource = normalizeCpmSource(settingsStore.getString("urad_src", DEFAULT_URAD_CPM_SOURCE), DEFAULT_URAD_CPM_SOURCE);
   activeNtpServer = settingsStore.getString("ntp_srv", String(DEFAULT_NTP_SERVER));
   activeCpmGaugeFullScale = (long)settingsStore.getInt("cpm_gauge", (int)DEFAULT_CPM_GAUGE_FULL_SCALE);
   activeStationName = settingsStore.getString("station_name", String(DEFAULT_STATION_NAME));
@@ -1852,6 +1909,8 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   settingsStore.putBool("ser_verbose", serialVerbose);
   settingsStore.putBool("rad_en", radmonUploadEnabled);
   settingsStore.putBool("urad_en", uradmonUploadEnabled);
+  settingsStore.putString("rad_src", normalizeCpmSource(server.arg("radmon_cpm_source"), activeRadmonCpmSource.c_str()));
+  settingsStore.putString("urad_src", normalizeCpmSource(server.arg("urad_cpm_source"), activeURadmonCpmSource.c_str()));
   settingsStore.putBool("dual_tube", dualTubeEnabled);
   if (timezoneOffsetValue.length() > 0)
   {
@@ -2457,14 +2516,17 @@ static String adminPageShell(const String &title, const String &subtitle, const 
   shell += "<header class='topbar'><div class='brand'><span class='brand-mark'>&#9762;</span><span>Environmental Logger</span></div><nav class='menu'>";
   shell += "<a href='/'" + String(title == "Dashboard" ? " class='active'" : "") + ">Dashboard</a>";
   shell += "<a href='/graphs'" + String(title == "Graphs" ? " class='active'" : "") + ">Graphs</a>";
+  const bool publicPage = (title == "Graphs");
+  shell += "<a href='/admin'>Admin</a>";
   shell += "<a href='/config'" + String(title == "Device Configuration" ? " class='active'" : "") + ">Config</a>";
-  if (title == "Device Configuration") {
+  if (!publicPage) {
     shell += "<a href='/ota-check'" + String(title == "OTA Status" ? " class='active'" : "") + ">OTA Check</a>";
     shell += "<a href='/update'>OTA Update</a>";
-    shell += "<a href='/json'>JSON</a>";
+    shell += "<a href='/admin/json'>JSON</a>";
+    shell += "<a href='#' onclick=\"fetch('/logout',{headers:{Authorization:'Basic '+btoa('x:x')}}).finally(function(){location.href='/';});return false;\">Logout</a>";
   }
   shell += "<div class='theme-picker'><label for='themeSelect'>Theme</label><select id='themeSelect'><option value='dark'>Dark</option><option value='light'>Light</option></select></div></nav></header>";
-  shell += "<section class='hero'><div class='hero-grid'><div><h1>" + htmlEscape(title) + "</h1><p>" + htmlEscape(subtitle) + "</p><div class='hero-meta'><span class='hero-chip'>Device IP <span class='mono'>" + htmlEscape(ipText) + "</span></span><span class='hero-chip'>Hostname <span class='mono'>" + htmlEscape(my_hostname) + "</span></span><span class='hero-chip'><span id='adminUptimeValue' class='mono'>uptime " + htmlEscape(uptimeText) + "</span></span></div></div></div></section>";
+  shell += "<section class='hero'><div class='hero-grid'><div><h1>" + htmlEscape(title) + "</h1><p>" + htmlEscape(subtitle) + "</p><div class='hero-meta'>" + String(publicPage ? "" : ("<span class='hero-chip'>Device IP <span class='mono'>" + htmlEscape(ipText) + "</span></span><span class='hero-chip'>Hostname <span class='mono'>" + htmlEscape(my_hostname) + "</span></span>")) + "<span class='hero-chip'><span id='adminUptimeValue' class='mono'>uptime " + htmlEscape(uptimeText) + "</span></span></div></div></div></section>";
   shell += "<script>if(!String.prototype.replaceAll){String.prototype.replaceAll=function(search,replacement){return this.split(search).join(replacement);};}</script>";
   shell += body;
   shell += "<footer style='text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted);border-top:1px solid var(--border);margin-top:28px;'>&copy; 2022&ndash;" + String(ntp.formattedTime("%Y")) + " &middot; By <a href='https://www.don-zalmrol.be/' target='_blank' rel='noopener'>Don Zalmrol</a> &middot; <a href='https://github.com/DonZalmrol' target='_blank' rel='noopener'>GitHub</a> &middot; <a href='#' onclick='document.getElementById(\"changelogDlg\").showModal();return false;' style='color:var(--muted);text-decoration:none;font-family:monospace;'>" + String(FIRMWARE_VERSION) + "</a></footer>";
@@ -2641,6 +2703,7 @@ static void connectToRadMonLogger(UploadSnapshot *snap)
 {
   UploadRecord currentUpload = {};
   copyUploadRecord(currentUpload, snap);
+  currentUpload.cpm = snap->cpmRadmon;
 
   if (!activeRadmonUploadEnabled)
   {
@@ -2671,7 +2734,7 @@ static void connectToRadMonLogger(UploadSnapshot *snap)
   ptr += "&password=";
   ptr += urlEncode(DataSendingPassWord);
   ptr += "&value=";
-  ptr += String(snap->cpm);
+  ptr += String(snap->cpmRadmon);
   ptr += "&unit=CPM";
   //ptr += "&datetime=";
   //ptr += String(epoch);
@@ -2693,7 +2756,7 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
 {
   UploadRecord currentUpload = {};
   copyUploadRecord(currentUpload, snap);
-  currentUpload.cpm = snap->cpm1;
+  currentUpload.cpm = snap->cpmURad;
   float estimatedDrivePct = estimateHvDriveUploadPct(snap->tubeVoltage);
 
   if (!activeURadmonUploadEnabled)
@@ -2781,7 +2844,7 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CPM))
   {
     ptr += "/0B/";                // 0B = optional: radiation measured on geiger tube in cpm
-    ptr += snap->cpm1;            // tube 1 CPM value
+    ptr += snap->cpmURad;         // CPM from the selected source
   }
 
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV))
@@ -3218,21 +3281,70 @@ static void Clean_Counters()
   }
 }
 
-void handleRootPath()
+static void sendDashboard(bool admin)
 {
+  server.sendHeader("Cache-Control", "no-store");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   // Stream the page in chunks to avoid allocating one giant String on the heap
-  for (const String &chunk : webPageChunks())
+  for (const String &chunk : webPageChunks(admin))
   {
     server.sendContent(chunk);
   }
   server.sendContent(""); // signal end of chunked response
 }
 
+void handleRootPath()
+{
+  sendDashboard(false);
+}
+
+void handleAdminPath()
+{
+  if (!requireAdminAuth()) return;
+  sendDashboard(true);
+}
+
+// Basic auth has no real logout: a 401 to the page's dummy credentials makes the browser drop the cached ones.
+void handleLogoutPath()
+{
+  server.sendHeader("Cache-Control", "no-store");
+  if (ADMIN_AUTH_ENABLED)
+  {
+    server.requestAuthentication();
+    return;
+  }
+  server.send(200, "text/plain", "Admin login is not enabled");
+}
+
+void handleAdminJsonPath()
+{
+  if (!requireAdminAuth()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", JsonPage(true));
+}
+
+// Unauthenticated liveness probe for reverse-proxy health checks; exposes no sensor or config data.
+static void handleHealthPath(void)
+{
+  String body = "{\"status\":\"ok\",\"uptime_s\":" + String((unsigned long)getUptimeSeconds()) + "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", body);
+}
+
+// The public JSON is rebuilt at most once per second regardless of how many viewers poll it.
 void handleJsonPath()
 {
-  server.send(200, "application/json", JsonPage());
+  static String cachedJson;
+  static uint32_t cachedAtMs = 0;
+  const uint32_t nowMs = millis();
+  if (cachedJson.length() == 0 || (uint32_t)(nowMs - cachedAtMs) >= 1000U)
+  {
+    cachedJson = JsonPage(false);
+    cachedAtMs = nowMs;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", cachedJson);
 }
 
 // JSON map of which EXP-controlled readings are enabled; used by the dashboard and graphs to hide disabled ones.
@@ -3283,14 +3395,57 @@ static String buildTubeProfileCardHtml(const String &p, const String &title, con
   return h;
 }
 
+static String hostFromUrl(String url)
+{
+  int scheme = url.indexOf("://");
+  if (scheme >= 0) url = url.substring(scheme + 3);
+  int slash = url.indexOf('/');
+  if (slash >= 0) url = url.substring(0, slash);
+  url.toLowerCase();
+  return url;
+}
+
+// State-changing requests must come from a page on this same host (Origin, or Referer as fallback).
+static bool isSameOriginRequest(void)
+{
+  String source = server.header("Origin");
+  if (source.length() == 0 || source == "null") source = server.header("Referer");
+  if (source.length() == 0) return false;
+  String sourceHost = hostFromUrl(source);
+  String host = server.header("Host");
+  host.toLowerCase();
+  String forwarded = server.header("X-Forwarded-Host");
+  forwarded.toLowerCase();
+  return sourceHost == host || (forwarded.length() > 0 && sourceHost == forwarded);
+}
+
+static const uint32_t ADMIN_IDLE_TIMEOUT_MS = 15UL * 60UL * 1000UL;
+static uint32_t lastAdminActivityMs = 0;
+
 static bool requireAdminAuth(void)
 {
-  if (!ADMIN_AUTH_ENABLED || server.authenticate(SECRET_ADMIN_USER, SECRET_ADMIN_PASS))
+  if (ADMIN_AUTH_ENABLED && !server.authenticate(SECRET_ADMIN_USER, SECRET_ADMIN_PASS))
   {
-    return true;
+    server.requestAuthentication();
+    return false;
   }
-  server.requestAuthentication();
-  return false;
+  if (ADMIN_AUTH_ENABLED)
+  {
+    const uint32_t nowMs = millis();
+    const bool idleExpired = (lastAdminActivityMs != 0) && ((uint32_t)(nowMs - lastAdminActivityMs) > ADMIN_IDLE_TIMEOUT_MS);
+    lastAdminActivityMs = nowMs | 1U;
+    if (idleExpired)
+    {
+      server.requestAuthentication();
+      return false;
+    }
+  }
+  if (server.method() != HTTP_GET && server.method() != HTTP_HEAD && !isSameOriginRequest())
+  {
+    server.send(403, "text/plain; charset=utf-8", "Cross-site request blocked");
+    return false;
+  }
+  return true;
 }
 
 void handleConfigPath()
@@ -3470,17 +3625,6 @@ void handleConfigPath()
   body += "<div class='col-md-6'><label class='form-label' for='wifi_hostname'>Hostname</label><input class='form-control' id='wifi_hostname' name='wifi_hostname' value='" + htmlEscape(my_hostname) + "'></div>";
   body += "<div class='col-12'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='d-flex flex-column flex-lg-row justify-content-between gap-3 align-items-lg-center'><div><div class='fw-semibold'>Nearby WiFi Networks</div><div class='hint'>Open the scanner page, pick an SSID there, and it will return here with the WiFi field prefilled.</div></div><a class='btn btn-outline-primary' href='/wifi-scan-page'>Open WiFi Scanner</a></div><div class='hint mt-3'>This flow uses a dedicated page instead of a large embedded script so scanning remains reliable on lightweight browsers and ESP32-hosted pages.</div></div></div>";
 
-  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>radmon.org</h3></div>";
-  body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='radmon_upload_enabled' name='radmon_upload_enabled'" + String(radmonUploadEnabledChecked ? " checked" : "") + "><label class='form-check-label' for='radmon_upload_enabled'>Enable Radmon uploads</label><div class='form-text'>When disabled, the device keeps sampling normally but skips Radmon submissions completely.</div></div></div>";
-  body += "<div class='col-md-6'><label class='form-label' for='radmon_user'>User Name</label><input class='form-control' id='radmon_user' name='radmon_user' value='" + htmlEscape(UserName) + "'></div>";
-  body += "<div class='col-md-6'><label class='form-label' for='radmon_password'>Password</label><input class='form-control' type='password' id='radmon_password' name='radmon_password' value='' placeholder='" + String(radmonPasswordStored ? "Stored value masked" : "Using default or empty") + "'><div class='form-text'>Leave blank to keep the current password.</div><div class='form-check mt-2'><input class='form-check-input' type='checkbox' id='radmon_password_reset' name='radmon_password_reset'><label class='form-check-label' for='radmon_password_reset'>Reset to compiled default</label></div></div>";
-
-  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>uRADMonitor</h3></div>";
-  body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='urad_upload_enabled' name='urad_upload_enabled'" + String(uradmonUploadEnabledChecked ? " checked" : "") + "><label class='form-check-label' for='urad_upload_enabled'>Enable uRADMonitor uploads</label><div class='form-text'>When disabled, the device keeps local logging and web features active but skips uRADMonitor submissions.</div></div></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='urad_user_id'>User ID</label><input class='form-control' id='urad_user_id' name='urad_user_id' value='" + htmlEscape(USER_ID) + "'></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='urad_user_key'>User Key</label><input class='form-control' type='password' id='urad_user_key' name='urad_user_key' value='' placeholder='" + String(uradKeyStored ? "Stored value masked" : "Using default or empty") + "'><div class='form-text'>Leave blank to keep the current key.</div><div class='form-check mt-2'><input class='form-check-input' type='checkbox' id='urad_user_key_reset' name='urad_user_key_reset'><label class='form-check-label' for='urad_user_key_reset'>Reset to compiled default</label></div></div>";
-  body += "<div class='col-md-4'><label class='form-label' for='urad_device_id'>Device ID</label><input class='form-control' id='urad_device_id' name='urad_device_id' value='" + htmlEscape(DEVICE_ID) + "'></div>";
-
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>Time and Region</h3></div>";
   body += "<div class='col-md-4'><label class='form-label' for='timezone_offset_minutes'>UTC Offset (minutes)</label><input class='form-control mono' id='timezone_offset_minutes' name='timezone_offset_minutes' value='" + htmlEscape(displayedTimezoneOffset) + "'><div class='form-text'>Examples: 60 for CET, 0 for UTC, -300 for EST.</div></div>";
   body += "<div class='col-md-4'><label class='form-label' for='dst_profile'>DST Profile</label><select class='form-select' id='dst_profile' name='dst_profile'>" + buildDstProfileOptionsHtml(displayedDstProfile) + "</select><div class='form-text'>Choose the daylight-saving rule set that matches your region.</div></div>";
@@ -3523,45 +3667,58 @@ void handleConfigPath()
   body += "<div class='col-12'>" + buildI2cDiscoveryHtml() + "</div>";
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>EXP Sensor Selection</h3></div>";
   body += "<div class='col-12'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-2'>Enable EXP sensor fields</div><div class='row g-4'>";
-  body += "<div class='col-12'><div class='small text-uppercase text-body-secondary mb-2'>Environmental fields</div><div class='row row-cols-1 row-cols-md-2 g-2'>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_temperature", "Temperature (02)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TEMPERATURE), "i2c", sharedI2cSummary) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pressure", "Pressure (03)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PRESSURE), "i2c", sharedI2cSummary) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_humidity", "Humidity (04)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HUMIDITY), "i2c", sharedI2cSummary) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_illuminance", "Illuminance / lux (05)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_ILLUMINANCE), "i2c", sharedI2cSummary) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_voc", "VOC (06)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_VOC), "i2c", sharedI2cSummary) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_co2", "CO2 (07)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CO2), "i2c", sharedI2cSummary) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_ch2o", "CH2O / HCHO (08)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CH2O), "hcho_adc_pin", "GPIO" + String(activeHchoAdcPin)) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pm25", "PM2.5 (09)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM25), "i2c", sharedI2cSummary) + "</div>";
-  body += "</div></div>";
-  body += "<div class='col-12'><div class='small text-uppercase text-body-secondary mb-2'>Radiation and device fields</div><div class='row row-cols-1 row-cols-md-2 g-2'>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_cpm", "Tube 1 CPM (0B)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CPM), "tube1_pin", "GPIO" + String(activeTube1PulsePin)) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_hv", "Tube voltage (0C)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV), "hv_adc_pin", "GPIO" + String(activeHvAdcPin)) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_hv_duty", "HV duty cycle (0D)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV_DUTY), "hv_adc_pin", "GPIO" + String(activeHvAdcPin)) + "</div>";
-  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_tube_type' name='exp_sensor_tube_type'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TUBE_TYPE) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_tube_type'>Tube type ID (10)</label></div></div>";
-  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_hardware_version' name='exp_sensor_hardware_version'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HARDWARE_VERSION) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_hardware_version'>Hardware version (0E)</label></div></div>";
-  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_firmware_version' name='exp_sensor_firmware_version'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_FIRMWARE_VERSION) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_firmware_version'>Firmware version (0F)</label></div></div>";
-  body += "<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='exp_sensor_wifi_signal' name='exp_sensor_wifi_signal'" + String(isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_WIFI_SIGNAL) ? " checked" : "") + "><label class='form-check-label' for='exp_sensor_wifi_signal'>Wi-Fi signal (1A, dBm)</label></div></div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pm1", "PM1.0 (12)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM1), "i2c", sharedI2cSummary) + "</div>";
-  body += "<div class='col'>" + buildExpToggleHtml("exp_sensor_pm10", "PM10 (13)", isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM10), "i2c", sharedI2cSummary) + "</div>";
-  for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+  body += "<div class='col-12'><div class='row row-cols-1 row-cols-md-2 g-2'>";
   {
-    const ExpExtraSensorDefinition &sensorDefinition = EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex];
-    const ExpExtraSensorConfig &sensorConfig = extraExpSensorConfigs[sensorIndex];
-    String fieldPrefix = String("exp_") + sensorDefinition.key;
-    bool selected = sensorConfig.configured && isExpSensorEnabled(activeExpSensorMask, sensorDefinition.sensorFlag);
-    String configuredStatus = sensorConfig.configured
-      ? "GPIO" + String(sensorConfig.pin) + " | scale " + String(sensorConfig.scale, 4) + " | offset " + String(sensorConfig.offset, 4)
-      : "Pin and calibration not configured";
-    body += "<div class='col'><div class='d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2'>";
-    body += "<div><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='exp_sensor_" + String(sensorDefinition.key) + "' name='exp_sensor_" + String(sensorDefinition.key) + "'" + String(selected ? " checked" : "") + String(sensorConfig.configured ? "" : " disabled") + "><label class='form-check-label' for='exp_sensor_" + String(sensorDefinition.key) + "'>" + String(sensorDefinition.label) + "</label></div><div class='form-text' id='exp_" + String(sensorDefinition.key) + "_status'>" + configuredStatus + "</div></div>";
-    String inputMode = sensorDefinition.inputMode == ExpExtraInputMode::AnalogLinear ? "analog" : (sensorDefinition.inputMode == ExpExtraInputMode::PulseRate ? "pulse-rate" : "pulse-total");
-    body += "<button type='button' class='btn btn-sm btn-outline-secondary' data-exp-setup='" + String(sensorDefinition.key) + "' data-exp-label='" + String(sensorDefinition.label) + "' data-exp-mode='" + inputMode + "'>Configure</button>";
-    body += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_pin' name='exp_" + String(sensorDefinition.key) + "_pin' value='" + String(sensorConfig.configured ? String(sensorConfig.pin) : String("")) + "'>";
-    body += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_scale' name='exp_" + String(sensorDefinition.key) + "_scale' value='" + String(sensorConfig.scale, 6) + "'>";
-    body += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_offset' name='exp_" + String(sensorDefinition.key) + "_offset' value='" + String(sensorConfig.offset, 6) + "'>";
-    body += "</div></div>";
+    // Fields are listed in EXP id order (hex), merging the built-in and configurable ones.
+    std::vector<std::pair<int, String>> expRows;
+    auto addToggle = [&](int code, const char *field, const char *label, uint32_t flag, const char *pinKey, const String &pinText) {
+      expRows.push_back({code, "<div class='col'>" + buildExpToggleHtml(field, label, isExpSensorEnabled(activeExpSensorMask, flag), pinKey, pinText) + "</div>"});
+    };
+    auto addPlain = [&](int code, const char *field, const char *label, uint32_t flag) {
+      expRows.push_back({code, String("<div class='col'><div class='form-check form-switch mb-2'><input class='form-check-input' type='checkbox' id='") + field + "' name='" + field + "'" + (isExpSensorEnabled(activeExpSensorMask, flag) ? " checked" : "") + "><label class='form-check-label' for='" + field + "'>" + label + "</label></div></div>"});
+    };
+    addToggle(0x02, "exp_sensor_temperature", "Temperature (02)", EXP_SENSOR_TEMPERATURE, "i2c", sharedI2cSummary);
+    addToggle(0x03, "exp_sensor_pressure", "Pressure (03)", EXP_SENSOR_PRESSURE, "i2c", sharedI2cSummary);
+    addToggle(0x04, "exp_sensor_humidity", "Humidity (04)", EXP_SENSOR_HUMIDITY, "i2c", sharedI2cSummary);
+    addToggle(0x05, "exp_sensor_illuminance", "Illuminance / lux (05)", EXP_SENSOR_ILLUMINANCE, "i2c", sharedI2cSummary);
+    addToggle(0x06, "exp_sensor_voc", "VOC (06)", EXP_SENSOR_VOC, "i2c", sharedI2cSummary);
+    addToggle(0x07, "exp_sensor_co2", "CO2 (07)", EXP_SENSOR_CO2, "i2c", sharedI2cSummary);
+    addToggle(0x08, "exp_sensor_ch2o", "CH2O / HCHO (08)", EXP_SENSOR_CH2O, "hcho_adc_pin", "GPIO" + String(activeHchoAdcPin));
+    addToggle(0x09, "exp_sensor_pm25", "PM2.5 (09)", EXP_SENSOR_PM25, "i2c", sharedI2cSummary);
+    addToggle(0x0B, "exp_sensor_cpm", "Tube 1 CPM (0B)", EXP_SENSOR_CPM, "tube1_pin", "GPIO" + String(activeTube1PulsePin));
+    addToggle(0x0C, "exp_sensor_hv", "Tube voltage (0C)", EXP_SENSOR_HV, "hv_adc_pin", "GPIO" + String(activeHvAdcPin));
+    addToggle(0x0D, "exp_sensor_hv_duty", "HV duty cycle (0D)", EXP_SENSOR_HV_DUTY, "hv_adc_pin", "GPIO" + String(activeHvAdcPin));
+    addPlain(0x0E, "exp_sensor_hardware_version", "Hardware version (0E)", EXP_SENSOR_HARDWARE_VERSION);
+    addPlain(0x0F, "exp_sensor_firmware_version", "Firmware version (0F)", EXP_SENSOR_FIRMWARE_VERSION);
+    addPlain(0x10, "exp_sensor_tube_type", "Tube type ID (10)", EXP_SENSOR_TUBE_TYPE);
+    addToggle(0x12, "exp_sensor_pm1", "PM1.0 (12)", EXP_SENSOR_PM1, "i2c", sharedI2cSummary);
+    addToggle(0x13, "exp_sensor_pm10", "PM10 (13)", EXP_SENSOR_PM10, "i2c", sharedI2cSummary);
+    addPlain(0x1A, "exp_sensor_wifi_signal", "Wi-Fi signal (1A, dBm)", EXP_SENSOR_WIFI_SIGNAL);
+    for (size_t sensorIndex = 0; sensorIndex < EXTRA_EXP_SENSOR_COUNT; ++sensorIndex)
+    {
+      const ExpExtraSensorDefinition &sensorDefinition = EXTRA_EXP_SENSOR_DEFINITIONS[sensorIndex];
+      const ExpExtraSensorConfig &sensorConfig = extraExpSensorConfigs[sensorIndex];
+      bool selected = sensorConfig.configured && isExpSensorEnabled(activeExpSensorMask, sensorDefinition.sensorFlag);
+      String configuredStatus = sensorConfig.configured
+        ? "GPIO" + String(sensorConfig.pin) + " | scale " + String(sensorConfig.scale, 4) + " | offset " + String(sensorConfig.offset, 4)
+        : "Pin and calibration not configured";
+      String row = "<div class='col'><div class='d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2'>";
+      row += "<div><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='exp_sensor_" + String(sensorDefinition.key) + "' name='exp_sensor_" + String(sensorDefinition.key) + "'" + String(selected ? " checked" : "") + String(sensorConfig.configured ? "" : " disabled") + "><label class='form-check-label' for='exp_sensor_" + String(sensorDefinition.key) + "'>" + String(sensorDefinition.label) + "</label></div><div class='form-text' id='exp_" + String(sensorDefinition.key) + "_status'>" + configuredStatus + "</div></div>";
+      String inputMode = sensorDefinition.inputMode == ExpExtraInputMode::AnalogLinear ? "analog" : (sensorDefinition.inputMode == ExpExtraInputMode::PulseRate ? "pulse-rate" : "pulse-total");
+      row += "<button type='button' class='btn btn-sm btn-outline-secondary' data-exp-setup='" + String(sensorDefinition.key) + "' data-exp-label='" + String(sensorDefinition.label) + "' data-exp-mode='" + inputMode + "'>Configure</button>";
+      row += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_pin' name='exp_" + String(sensorDefinition.key) + "_pin' value='" + String(sensorConfig.configured ? String(sensorConfig.pin) : String("")) + "'>";
+      row += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_scale' name='exp_" + String(sensorDefinition.key) + "_scale' value='" + String(sensorConfig.scale, 6) + "'>";
+      row += "<input type='hidden' id='exp_" + String(sensorDefinition.key) + "_offset' name='exp_" + String(sensorDefinition.key) + "_offset' value='" + String(sensorConfig.offset, 6) + "'>";
+      row += "</div></div>";
+      expRows.push_back({sensorDefinition.expFieldId, row});
+    }
+    std::stable_sort(expRows.begin(), expRows.end(), [](const std::pair<int, String> &a, const std::pair<int, String> &b) { return a.first < b.first; });
+    for (const auto &entry : expRows)
+    {
+      body += entry.second;
+    }
   }
-  body += "</div></div></div></div>";
+  body += "</div></div></div></div></div>";
   body += "<div class='col-12'><p class='form-text mb-0'>Configure the input profile before enabling a field. Analog inputs use volts × scale + offset; pulse inputs use pulse rate × scale + offset, except rain which uses pulse total × scale + offset. Save and reboot after changing a profile or its enabled state.</p></div>";
   body += "<dialog id='expSensorSetupDialog' style='background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:560px;width:92vw;color:var(--text);'>";
   body += "<h3 class='h5' id='expSensorSetupTitle'>Configure EXP input</h3><p class='hint' id='expSensorSetupHelp'></p>";
@@ -3575,6 +3732,19 @@ void handleConfigPath()
   body += "<div class='col-12 col-md-6'><label class='form-label' for='hv_calibration_factor'>Tube HV Calibration</label><input class='form-control mono' id='hv_calibration_factor' name='hv_calibration_factor' value='" + htmlEscape(displayedHvCalibrationFactor) + "'><div class='form-text'>ADC-to-HV multiplier used by the tube voltage display.</div></div>";
   body += "<div class='col-12 col-md-6'><label class='form-label' for='hcho_r0'>HCHO R0</label><input class='form-control mono' id='hcho_r0' name='hcho_r0' value='" + htmlEscape(displayedHchoR0) + "'><div class='form-text'>Sensor calibration value used by the Grove HCHO conversion formula.</div></div>";
   body += "</div></div></div>";
+
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>radmon.org</h3></div>";
+  body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='radmon_upload_enabled' name='radmon_upload_enabled'" + String(radmonUploadEnabledChecked ? " checked" : "") + "><label class='form-check-label' for='radmon_upload_enabled'>Enable Radmon uploads</label><div class='form-text'>When disabled, the device keeps sampling normally but skips Radmon submissions completely.</div></div></div>";
+  body += "<div class='col-md-6'><label class='form-label' for='radmon_user'>User Name</label><input class='form-control' id='radmon_user' name='radmon_user' value='" + htmlEscape(UserName) + "'></div>";
+  body += "<div class='col-md-6'><label class='form-label' for='radmon_password'>Password</label><input class='form-control' type='password' id='radmon_password' name='radmon_password' value='' placeholder='" + String(radmonPasswordStored ? "Stored value masked" : "Using default or empty") + "'><div class='form-text'>Leave blank to keep the current password.</div><div class='form-check mt-2'><input class='form-check-input' type='checkbox' id='radmon_password_reset' name='radmon_password_reset'><label class='form-check-label' for='radmon_password_reset'>Reset to compiled default</label></div></div>";
+  body += buildCpmSourceSelectHtml("radmon_cpm_source", activeRadmonCpmSource);
+
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>uRADMonitor</h3></div>";
+  body += "<div class='col-12'><div class='form-check form-switch'><input class='form-check-input' type='checkbox' id='urad_upload_enabled' name='urad_upload_enabled'" + String(uradmonUploadEnabledChecked ? " checked" : "") + "><label class='form-check-label' for='urad_upload_enabled'>Enable uRADMonitor uploads</label><div class='form-text'>When disabled, the device keeps local logging and web features active but skips uRADMonitor submissions.</div></div></div>";
+  body += "<div class='col-md-4'><label class='form-label' for='urad_user_id'>User ID</label><input class='form-control' id='urad_user_id' name='urad_user_id' value='" + htmlEscape(USER_ID) + "'></div>";
+  body += "<div class='col-md-4'><label class='form-label' for='urad_user_key'>User Key</label><input class='form-control' type='password' id='urad_user_key' name='urad_user_key' value='' placeholder='" + String(uradKeyStored ? "Stored value masked" : "Using default or empty") + "'><div class='form-text'>Leave blank to keep the current key.</div><div class='form-check mt-2'><input class='form-check-input' type='checkbox' id='urad_user_key_reset' name='urad_user_key_reset'><label class='form-check-label' for='urad_user_key_reset'>Reset to compiled default</label></div></div>";
+  body += "<div class='col-md-4'><label class='form-label' for='urad_device_id'>Device ID</label><input class='form-control' id='urad_device_id' name='urad_device_id' value='" + htmlEscape(DEVICE_ID) + "'></div>";
+  body += buildCpmSourceSelectHtml("urad_cpm_source", activeURadmonCpmSource);
 
   body += "<div class='col-12 d-flex flex-wrap gap-2 pt-2 cfg-actions'><button type='submit' class='btn btn-primary'>Save Settings</button><button type='submit' formaction='/reboot' formmethod='post' class='btn btn-warning'>Save and Reboot</button><button type='submit' formaction='/restart' formmethod='post' class='btn btn-outline-secondary'>Reboot Only</button><a class='btn btn-outline-secondary' href='/ota-check'>Review OTA Status</a><a class='btn btn-outline-secondary' href='/update'>Open OTA Update</a></div>";
   body += "<dialog id='hardwarePinSetupDialog' style='background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:560px;width:92vw;color:var(--text);'><h3 class='h5' id='hardwarePinSetupTitle'>Configure sensor pins</h3><p class='hint' id='hardwarePinSetupHelp'></p>";
@@ -3603,8 +3773,6 @@ void handleConfigPath()
   body += "<script>(function(){function wire(p){var select=document.getElementById(p==='tube'?'tube_preset':'tube2_preset');var facts=document.getElementById(p+'PresetFacts');var fields=document.getElementById(p+'CustomFields');var deadText=document.getElementById(p+'DeadText');var convText=document.getElementById(p+'ConvText');if(!select||!facts||!fields){return;}function update(){var option=select.options[select.selectedIndex];var custom=select.value==='custom';facts.style.display=custom?'none':'';fields.style.display=custom?'':'none';if(option&&!custom){if(deadText){deadText.textContent=(option.getAttribute('data-dead-us')||'')+' us';}if(convText){convText.textContent=(option.getAttribute('data-conv')||'')+' uSv/h per CPM';}}}select.addEventListener('change',update);update();}wire('tube');wire('tube2');var dual=document.getElementById('dual_tube_enabled');if(dual){function syncV(){['tube2_vmin','tube2_vmax'].forEach(function(id){var el=document.getElementById(id);if(el){el.disabled=!dual.checked;}});}dual.addEventListener('change',syncV);syncV();}})();</script>";
   body += "<script>(function(){function syncCode(selectId,codeId){var select=document.getElementById(selectId);var code=document.getElementById(codeId);if(!select||!code){return;}function update(){var option=select.options[select.selectedIndex];code.textContent=option?option.getAttribute('data-exp-id')||'0x00':'0x00';}select.addEventListener('change',update);update();}syncCode('tube_preset','tubeExpCode');syncCode('tube2_preset','tube2ExpCode');})();</script>";
   body += "<script>(function(){function byId(id){return document.getElementById(id);}var dialog=byId('hardwarePinSetupDialog');var title=byId('hardwarePinSetupTitle');var help=byId('hardwarePinSetupHelp');var i2cRows=byId('hardwareI2cRows');var analogRow=byId('hardwareAnalogRow');var pulseRow=byId('hardwarePulseRow');var sda=byId('hardwarePinSda');var scl=byId('hardwarePinScl');var analogPin=byId('hardwareAnalogPin');var pulsePin=byId('hardwarePulsePin');var target='';var mode='';document.querySelectorAll('[data-pin-setup]').forEach(function(button){button.addEventListener('click',function(){target=button.getAttribute('data-pin-setup');mode=target==='i2c'?'i2c':((target==='hv_adc_pin'||target==='hcho_adc_pin')?'analog':'pulse');title.textContent='Configure '+(target==='i2c'?'shared I2C bus':target.replaceAll('_',' '));i2cRows.style.display=mode==='i2c'?'':'none';analogRow.style.display=mode==='analog'?'':'none';pulseRow.style.display=mode==='pulse'?'':'none';if(mode==='i2c'){sda.value=byId('i2c_sda_pin').value;scl.value=byId('i2c_scl_pin').value;help.textContent='These pins are shared by BME680, HM3301, and TSL2561. Reboot after applying.';}else if(mode==='analog'){analogPin.value=byId(target).value;help.textContent='Select an ADC1 input. Never apply more than 3.3 V to an ESP32 GPIO.';}else{pulsePin.value=byId(target).value;help.textContent='Select a digital input GPIO. Reboot after applying pin changes.';}dialog.showModal();});});byId('hardwarePinApply').addEventListener('click',function(){if(mode==='i2c'){if(!sda.value||!scl.value||sda.value===scl.value){help.textContent='Select two distinct GPIO pins for SDA and SCL.';return;}byId('i2c_sda_pin').value=sda.value;byId('i2c_scl_pin').value=scl.value;byId('pinSummary_i2c').textContent='GPIO'+sda.value+' / GPIO'+scl.value;}else{var pin=mode==='analog'?analogPin.value:pulsePin.value;if(!pin){help.textContent='Select a GPIO pin before applying.';return;}byId(target).value=pin;var summary=byId('pinSummary_'+target);if(summary){summary.textContent='GPIO'+pin;}}dialog.close();});byId('hardwarePinCancel').addEventListener('click',function(){dialog.close();});var dual=byId('dual_tube_enabled');var tube2Row=byId('tube2PinConfigRow');if(dual&&tube2Row){function updateTube2Pin(){tube2Row.style.display=dual.checked?'':'none';}dual.addEventListener('change',updateTube2Pin);updateTube2Pin();}})();</script>";
-  body += "<script>(function(){var dialog=document.getElementById('hardwarePinSetupDialog');var title=document.getElementById('hardwarePinSetupTitle');var help=document.getElementById('hardwarePinSetupHelp');var i2cRows=document.getElementById('hardwareI2cRows');var analogRow=document.getElementById('hardwareAnalogRow');var pulseRow=document.getElementById('hardwarePulseRow');var sda=document.getElementById('hardwarePinSda');var scl=document.getElementById('hardwarePinScl');var analogPin=document.getElementById('hardwareAnalogPin');var pulsePin=document.getElementById('hardwarePulsePin');var target='';var mode='';document.querySelectorAll('[data-pin-setup]').forEach(function(button){button.addEventListener('click',function(){target=button.getAttribute('data-pin-setup');mode=target==='i2c'?'i2c':((target==='hv_adc_pin'||target==='hcho_adc_pin')?'analog':'pulse');title.textContent='Configure '+(target==='i2c'?'shared I2C bus':target.replace(/_/g,' '));i2cRows.style.display=mode==='i2c'?'':'none';analogRow.style.display=mode==='analog'?'':'none';pulseRow.style.display=mode==='pulse'?'':'none';if(mode==='i2c'){sda.value=document.getElementById('i2c_sda_pin').value;scl.value=document.getElementById('i2c_scl_pin').value;help.textContent='Shared by BME680, HM3301, and TSL2561. Reboot after saving pin changes.';}else if(mode==='analog'){analogPin.value=document.getElementById(target).value;help.textContent='Choose an ADC1 pin. Never apply more than 3.3 V to an ESP32 GPIO.';}else{pulsePin.value=document.getElementById(target).value;help.textContent='Choose a supported digital input pin. Reboot after saving pin changes.';}dialog.showModal();});});document.getElementById('hardwarePinApply').addEventListener('click',function(){if(mode==='i2c'){if(!sda.value||!scl.value||sda.value===scl.value){help.textContent='Select distinct SDA and SCL pins.';return;}document.getElementById('i2c_sda_pin').value=sda.value;document.getElementById('i2c_scl_pin').value=scl.value;document.getElementById('pinSummary_i2c').textContent='GPIO'+sda.value+' / GPIO'+scl.value;}else{var pin=mode==='analog'?analogPin.value:pulsePin.value;if(!pin){help.textContent='Select a pin before applying.';return;}document.getElementById(target).value=pin;var summary=document.getElementById('pinSummary_'+target);if(summary){summary.textContent='GPIO'+pin;}}dialog.close();});document.getElementById('hardwarePinCancel').addEventListener('click',function(){dialog.close();});var dual=document.getElementById('dual_tube_enabled');var tube2Row=document.getElementById('tube2PinConfigRow');if(dual&&tube2Row){function syncTube2(){tube2Row.style.display=dual.checked?'':'none';}dual.addEventListener('change',syncTube2);syncTube2();}})();</script>";
-  body += "<script>(function(){var sequence=['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','b','a'];var position=0;var active=false;document.addEventListener('keydown',function(event){var key=event.key.length===1?event.key.toLowerCase():event.key;if(key===sequence[position]){event.preventDefault();position++;if(position===sequence.length){position=0;if(active){return;}active=true;var overlay=document.createElement('div');overlay.id='pythonFootSmash';overlay.innerHTML='<div class=\"smash-foot\">&#129718;</div><div class=\"smash-caption\">THWACK! Page flattened.</div>';overlay.style.cssText='position:fixed;inset:0;z-index:100000;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(8,12,18,.78);color:white;pointer-events:none;';var style=document.createElement('style');style.textContent='@keyframes page-smush{0%{transform:scaleY(1)}30%{transform:scaleY(.035)}60%{transform:scaleY(.12)}100%{transform:scaleY(1)}}@keyframes foot-stomp{0%{transform:translateY(-80vh) rotate(-24deg) scale(1.8)}52%{transform:translateY(5vh) rotate(0) scale(1)}72%{transform:translateY(-3vh) scale(.9)}100%{transform:translateY(0) scale(1)}}body.konami-smushed>main.page-shell{transform-origin:center center;animation:page-smush 900ms ease-in-out}#pythonFootSmash .smash-foot{font-size:clamp(8rem,38vw,24rem);line-height:.85;animation:foot-stomp 900ms cubic-bezier(.22,.8,.25,1)}#pythonFootSmash .smash-caption{font-size:1.25rem;font-weight:700;text-align:center;margin-top:1rem}';document.head.appendChild(style);document.body.appendChild(overlay);document.body.classList.add('konami-smushed');setTimeout(function(){document.body.classList.remove('konami-smushed');overlay.remove();style.remove();active=false;},1800);}}else{position=key===sequence[0]?1:0;}});})();</script>";
   body += "<script>(function(){var dialog=document.getElementById('hardwarePinSetupDialog');function update(){var sda=document.getElementById('i2c_sda_pin').value;var scl=document.getElementById('i2c_scl_pin').value;document.querySelectorAll('[data-pin-summary=i2c]').forEach(function(node){node.textContent='GPIO'+sda+' / GPIO'+scl;});['hv_adc_pin','hcho_adc_pin','tube1_pin','tube2_pin'].forEach(function(key){var select=document.getElementById(key);document.querySelectorAll('[data-pin-summary='+key+']').forEach(function(node){node.textContent='GPIO'+select.value;});});}if(dialog){dialog.addEventListener('close',update);}update();})();</script>";
   server.send(200, "text/html; charset=utf-8", adminPageShell("Device Configuration", "Edit runtime WiFi and upload credentials stored on the ESP32.", body));
 }
@@ -3880,6 +4048,8 @@ void handleSimpleRebootPath()
 
 void handleOtaCheckPath()
 {
+  if (!requireAdminAuth()) return;
+
   const esp_partition_t *runningPartition = esp_ota_get_running_partition();
   const esp_partition_t *nextPartition = esp_ota_get_next_update_partition(NULL);
   size_t totalAppPartitionBytes = getAppPartitionTotalBytes();
@@ -3993,6 +4163,17 @@ static void refreshCpuLoadMetrics(void)
 {
   cpuLoadCore0Pct = constrain(100.0f - (float)ulTaskGetIdleRunTimePercentForCore(0), 0.0f, 100.0f);
   cpuLoadCore1Pct = constrain(100.0f - (float)ulTaskGetIdleRunTimePercentForCore(1), 0.0f, 100.0f);
+}
+
+static unsigned long selectUploadCpm(const String &source)
+{
+  const float dualDiv = activeDualTubeEnabled ? 2.0f : 1.0f;
+  if (source == "t1_raw") return actual_cps_1 * 60UL;
+  if (source == "t2_raw") return actual_cps_2 * 60UL;
+  if (source == "c_raw")  return (unsigned long)roundf((actual_cps_1 + actual_cps_2) * 60.0f / dualDiv);
+  if (source == "t1_avg") return cpm1;
+  if (source == "t2_avg") return cpm2;
+  return cpm;
 }
 
 static float movingAvgToCpm(movingAvg &avg)
@@ -4525,7 +4706,7 @@ static void pruneHistoryLogIfNeeded(void)
 
 // Return the dashboard HTML as an array of chunks to stream with sendContent()
 // Splitting avoids allocating one huge String on the heap at once.
-std::vector<String> webPageChunks()
+std::vector<String> webPageChunks(bool admin)
 {
   std::vector<String> chunks;
   const String uptimeText = formatUptime(getUptimeSeconds());
@@ -4540,7 +4721,7 @@ std::vector<String> webPageChunks()
     + "<title>" + htmlEscape(my_hostname) + " : Environmental Logger</title>"
   );
   chunks.push_back(
-    "<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js'></script>"
+    String(admin ? "" : "<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js'></script>") +
     "<style>"
     ":root{--bg:#10161d;--bg-soft:#17212b;--card:#1c2733;--border:#334456;--text:#f3f7fb;--muted:#c5d1dd;--accent:#58a6ff;--accent-strong:#3d8bfd;--tableHead:#1b2833;--tableRow:#16202a;--chip:#1a2834;--gaugeBg:#314151;--shadow:rgba(0,0,0,.28);--heroA:#17324a;--heroB:#245e86;--surface:rgba(255,255,255,.08);color-scheme:dark;}"
     "body[data-theme='light']{--bg:#eff4f8;--bg-soft:#f7fafc;--card:#ffffff;--border:#d4dee8;--text:#17212b;--muted:#5d6d7d;--accent:#1e6bd6;--accent-strong:#1451a8;--tableHead:#e5eef6;--tableRow:#f8fbfd;--chip:#eef3f7;--gaugeBg:#d8e1ea;--shadow:rgba(22,41,66,.12);--heroA:#ddebf7;--heroB:#f7fbff;--surface:rgba(255,255,255,.72);color-scheme:light;}"
@@ -4613,8 +4794,8 @@ std::vector<String> webPageChunks()
 
   // ── TITLE ────────────────────────────────────────────────────────────────
   chunks.push_back(
-    String("<header class='topbar'><div class='brand'><span class='brand-mark'>&#9762;</span><span>Environmental Logger</span></div><nav class='menu'><a class='menu-link active' href='/'>Dashboard</a><a class='menu-link' href='/graphs'>Graphs</a><a class='menu-link' href='/config'>Config</a><div class='theme-picker'><label for='themeSelect'>Theme</label><select id='themeSelect'><option value='dark'>Dark</option><option value='light'>Light</option></select></div></nav></header>")
-    + "<section class='hero'><h1>" + htmlEscape(activeStationName) + "</h1><p class='hero-lead'>Live environmental, radiation, storage, and upload telemetry from the ESP32 station.</p><div class='hero-meta'><span class='hero-chip'><span id='clockValue'>" + String(ntp.formattedTime("%T  |  %F"))
+    String("<header class='topbar'><div class='brand'><span class='brand-mark'>&#9762;</span><span>Environmental Logger</span></div><nav class='menu'><a class='menu-link" + String(admin ? "" : " active") + "' href='/'>Dashboard</a><a class='menu-link' href='/graphs'>Graphs</a><a class='menu-link" + String(admin ? " active" : "") + "' href='/admin'>Admin</a><a class='menu-link' href='/config'>Config</a>" + String(admin ? "<a class='menu-link' href='#' onclick=\"fetch('/logout',{headers:{Authorization:'Basic '+btoa('x:x')}}).finally(function(){location.href='/';});return false;\">Logout</a>" : "") + "<div class='theme-picker'><label for='themeSelect'>Theme</label><select id='themeSelect'><option value='dark'>Dark</option><option value='light'>Light</option></select></div></nav></header>")
+    + "<section class='hero'><h1>" + htmlEscape(activeStationName) + "</h1><p class='hero-lead'>" + String(admin ? "Device resources, network and upload status (admin only)." : "Live environmental and radiation telemetry from the ESP32 station.") + "</p><div class='hero-meta'><span class='hero-chip'><span id='clockValue'>" + String(ntp.formattedTime("%T  |  %F"))
     + "</span></span><span class='hero-chip'><span id='cycleValue'>cycle " + String(increaseSecCount) + " / 60</span></span><span class='hero-chip'><span id='uptimeValue'>uptime " + uptimeText + "</span></span></div></section>"
   );
 
@@ -4628,7 +4809,7 @@ std::vector<String> webPageChunks()
   // Tube voltage gauge: nominal 360–430 V, display against 500 V max
   int hvPct   = constrain((int)(tubeVoltage * 100.0 / 500.0), 0, 100);
 
-  chunks.push_back(
+  if (!admin) chunks.push_back(
     String("<section><h2>&#9762; Radiation</h2><div class='grid'>")
     // Dose rate
     + "<div class='card'>"
@@ -4698,7 +4879,7 @@ std::vector<String> webPageChunks()
   const char* accStr = (var_iaqAccuracy >= 0 && var_iaqAccuracy <= 3)
                        ? iaqLabel[var_iaqAccuracy] : "?";
 
-  chunks.push_back(
+  if (!admin) chunks.push_back(
     String("<section><h2>&#127807; Air Quality</h2><div class='grid'>")
     // IAQ
     + "<div class='card'>"
@@ -4748,7 +4929,7 @@ std::vector<String> webPageChunks()
   );
 
   // ── ENVIRONMENT CARDS ─────────────────────────────────────────────────────
-  chunks.push_back(
+  if (!admin) chunks.push_back(
     String("<section><h2>&#127777; Environment</h2><div class='grid'>")
     // Temperature
     + "<div class='card'>"
@@ -4816,7 +4997,7 @@ std::vector<String> webPageChunks()
                      + "<span>Gateway: " + WiFi.gatewayIP().toString() + "</span>"
                      + "<span>MAC: " + WiFi.macAddress() + "</span>";
 
-  chunks.push_back(
+  if (admin) chunks.push_back(
     String("<section><h2>&#9881; Resources</h2><div class='grid'>")
     + "<div class='card'>"
       "<div class='card-title'>CPU Core 0</div>"
@@ -4877,7 +5058,7 @@ std::vector<String> webPageChunks()
   String radStatusText = uploadStatusText(uploadStatus.statusCodeRadmon);
   String uradStatusText = uploadStatusText(uploadStatus.statusCodeURadmon);
 
-  chunks.push_back(
+  if (admin) chunks.push_back(
     String("<section><h2>&#9652; Uploads</h2>")
     + "<table><tr><th>Platform</th><th>Status</th><th>Dashboard</th></tr>"
     + "<tr><td><details class='upload-toggle'><summary>Radmon</summary><div id='radmonDetails'>" + radmonUploadDetailsHtml(uploadStatus.radmon) + "</div></details></td>"
@@ -4890,8 +5071,8 @@ std::vector<String> webPageChunks()
   );
 
   // ── LIVE CHARTS (browser-side, poll /json every 5 s) ─────────────────────
-  chunks.push_back(
-    String("<section><h2>&#128200; Live History (auto-updates every 1 s)</h2>")
+  if (!admin) chunks.push_back(
+    String("<section><h2>&#128200; Live History (auto-updates every 3 s)</h2>")
     + "<div class='chart-card'><h3>Dose rate &#xb5;Sv/h</h3><canvas id='cDose' height='80'></canvas></div>"
     + "<div class='chart-card'><h3>CPM (combined + per tube)</h3><canvas id='cCpm' height='80'></canvas></div>"
     + "<div class='chart-card'><h3>CPS per tube &amp; moving average</h3><canvas id='cCps' height='80'></canvas></div>"
@@ -4905,8 +5086,11 @@ std::vector<String> webPageChunks()
   // ── CHART.JS SCRIPT ───────────────────────────────────────────────────────
   chunks.push_back(
     String("<script>")
+    + (admin ? "window.Chart=function(){this.data={labels:[],datasets:[]};this.options={plugins:{legend:{labels:{}}},scales:{x:{ticks:{},grid:{}},y:{ticks:{},grid:{}}}};this.update=function(){};};" : "")
+    + "const IS_ADMIN=" + String(admin ? "true" : "false") + ";"
     + "const MAX_PTS=60;"
-    + "const FAST_POLL_MS=1000;"
+    + "const JSON_URL='" + String(admin ? "/admin/json" : "/json") + "';"
+    + "const FAST_POLL_MS=" + String(admin ? "1000" : "3000") + ";"
     + "const THEME_KEY='envLoggerTheme';"
     + "let C={text:'#e0e0e0',grid:'#333',accent:'#64b5f6'};"
     + "const IAQ_LABELS=['Stabilizing','Uncertain','Calibrating','Calibrated'];"
@@ -5156,15 +5340,12 @@ std::vector<String> webPageChunks()
     + "}"
     + "async function poll(){"
     + "  try{"
-    + "    const r=await fetch('/json',{cache:'no-store'});"
+    + "    const r=await fetch(JSON_URL,{cache:'no-store'});"
     + "    if(!r.ok)return;"
     + "    const d=await r.json();"
     + "    updateHeader(d);"
-    + "    updateRadiationCards(d);"
-    + "    updateResources(d);"
-    + "    updateSlowCards(d);"
-    + "    updateUploads(d);"
-    + "    updateCharts(d);"
+    + "    if(!IS_ADMIN){updateRadiationCards(d);updateSlowCards(d);updateCharts(d);}"
+    + "    if(IS_ADMIN){updateResources(d);updateUploads(d);}"
     + "  }catch(e){console.warn('poll error',e);}"
     + "}"
     + "initTheme();"
@@ -5182,7 +5363,7 @@ std::vector<String> webPageChunks()
   return chunks;
 }
 
-String JsonPage()
+String JsonPage(bool admin)
 {
   String json = "";
   UploadStatusSnapshot uploadStatus = {};
@@ -5307,6 +5488,22 @@ String JsonPage()
   uradmonJson["var_pm25"] = uploadStatus.uradmon.var_pm25;
   uradmonJson["var_pm10"] = uploadStatus.uradmon.var_pm10;
 
+  if (!admin)
+  {
+    // Internal device, network and upload details are served only by the authenticated /admin/json.
+    static const char *const adminOnlyKeys[] = {
+      "hvCalibrationFactor", "hchoR0", "historyRetentionSamples", "historyRetentionHours", "ntpServer",
+      "loopActivePct", "cpuLoadCore0Pct", "cpuLoadCore1Pct", "freeHeapBytes", "totalHeapBytes",
+      "usedAppPartitionBytes", "freeAppPartitionBytes", "totalAppPartitionBytes", "fsMounted", "freeFsBytes",
+      "totalFsBytes", "wifiConnected", "wifiSsid", "wifiRssiDbm", "wifiSignalPct", "wifiIp", "wifiGateway",
+      "wifiMac", "i2cDevicesFound", "statusCodeRadmon", "statusCodeURadmon", "radmonUploadEnabled",
+      "uradmonUploadEnabled", "radmonUpload", "uradmonUpload", "timezoneOffsetMinutes", "timezoneOffsetLabel",
+      "dstProfile", "dstProfileLabel", "dstOffsetMinutes"};
+    for (const char *key : adminOnlyKeys)
+    {
+      doc.remove(key);
+    }
+  }
   serializeJson(doc, json);
 
   return json;
