@@ -2,6 +2,8 @@
 
 > **Firmware version:** v1.4e &nbsp;|&nbsp; **Platform:** ESP32 Wrover-E &nbsp;|&nbsp; **Framework:** Arduino (ESP-IDF v5)
 
+**Live public view:** <https://environmental.don-zalmrol.be/>
+
 A full-featured environmental monitoring station built around the ESP32 Wrover-E.  
 It continuously samples ionising radiation (two GM tubes), air quality (IAQ / CO₂ / VOC / HCHO), particulate matter, temperature, pressure, humidity and visible light, then presents everything through a live web dashboard and uploads a summary to public radiation-monitoring platforms every 61 seconds.
 
@@ -249,6 +251,8 @@ Every EXP field (id in hex) and how its value is produced. Fields can be disable
 EXP fields: `0B` Tube 1 CPM, `10` tube type id, `0E` / `0F` hardware and firmware version.
 
 ### Tube coincidence (muon candidates)
+
+**Setting the window:** open `/config` (admin login), go to Radiation Tube Setup, enable the second GM tube, tick "Tube coincidence (muon candidate) counter" and enter the "Coincidence window (us)" (5 – 1000, default 50). Save and reboot; the interrupts are attached at boot, so changes only apply after a restart. A window of about 20 – 100 µs suits most setups: too small misses real pairs because of pulse timing jitter, too large raises the accidental rate in proportion. The window is unrelated to the tube dead time, so there is no need to match it (for example 250 µs).
 
 With two tubes, a GPIO interrupt on each tube pin timestamps every pulse. A pulse on one tube within the coincidence window $w$ (default 50 µs) of a pulse on the other counts as one coincidence. The dashboard shows the count over the last 60 s.
 
