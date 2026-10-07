@@ -109,6 +109,7 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
 <div class="card mt-4"><div class="card-body"><h2 class="h5 mb-3" style="color:var(--accent)">IAQ and CO2</h2><canvas id="graphsAir" height="90"></canvas></div></div>
 <div class="card mt-4"><div class="card-body"><h2 class="h5 mb-3" style="color:var(--accent)">Particulate Matter</h2><canvas id="graphsPm" height="90"></canvas></div></div>
 <div class="card mt-4"><div class="card-body"><h2 class="h5 mb-3" style="color:var(--accent)">HV, Luminosity, HCHO &amp; VOC</h2><canvas id="graphsEnv" height="90"></canvas></div></div>
+<div class="card mt-4"><div class="card-body"><h2 class="h5 mb-3" style="color:var(--accent)">Tube Coincidences (muon candidates per minute)</h2><canvas id="graphsCoinc" height="90"></canvas></div></div>
 
 <footer>&copy; 2022&ndash;2026 &middot; By <a href="https://www.don-zalmrol.be/" target="_blank" rel="noopener">Don Zalmrol</a> &middot; <a href="https://github.com/DonZalmrol" target="_blank" rel="noopener">GitHub</a> &middot; <span class="mono">v1.4e</span></footer>
 </main>
@@ -171,6 +172,10 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
     ds('Luminosity lux',palette.light,gen(47,120,20)),
     ds('HCHO ppm',palette.hcho,gen(.012,.003,.001)),
     ds('VOC ppm',palette.voc,gen(.08,.02,.008))
+  ]);
+
+  mkChart('graphsCoinc',[
+    ds('Coincidences / min','#26c6da',genInt(2,2,2))
   ]);
 })();
 </script>

@@ -237,6 +237,8 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
             </div>
           </div>
           <div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" checked><label class="form-check-label">Enable second GM tube</label></div></div>
+          <div class="col-md-8"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" checked><label class="form-check-label">Tube coincidence (muon candidate) counter</label><div class="form-text">Counts pulses seen on both tubes within the window below. Needs two tubes; applied after reboot. Best with the tubes stacked one above the other.</div></div></div>
+          <div class="col-md-4"><label class="form-label">Coincidence window (us)</label><input class="form-control mono" type="number" min="5" max="1000" value="50"><div class="form-text">5 - 1000, default 50.</div></div>
           <div class="col-md-6">
             <label class="form-label">Tube 2 Type</label>
             <select class="form-select"><option>SBM-20</option><option selected>Custom</option></select>
