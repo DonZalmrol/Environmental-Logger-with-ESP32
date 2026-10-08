@@ -116,6 +116,24 @@ footer{text-align:center;padding:22px 0 10px;font-size:.77rem;color:var(--muted)
             <input class="form-control" id="station_name" value="Station Dashboard">
             <div class="form-text">Label shown in the dashboard title.</div>
           </div>
+          <div class="col-md-6">
+            <label class="form-label" for="device_location">Device Location</label>
+            <select class="form-select" id="device_location"><option value="indoor" selected>Indoor</option><option value="outdoor">Outdoor</option></select>
+            <div class="form-text">Selects the dashboard temperature and humidity colour ranges. Applied after reboot.</div>
+          </div>
+          <div class="col-12" id="rangeFields">
+            <h4 class="h6 mb-0">Bar colour ranges</h4>
+            <div class="form-text mb-2">Dashboard bar colours for the selected location. Re-selecting a location restores its defaults.</div>
+            <div class="mb-3"><div id="temp_prev" style="height:10px;border-radius:5px;margin-bottom:10px"></div><div class="row g-3" id="temp_rows"></div></div>
+            <div class="mb-3"><div id="hum_prev" style="height:10px;border-radius:5px;margin-bottom:10px"></div><div class="row g-3" id="hum_rows"></div></div>
+            <script>(function(){var D={indoor:{temp:[16,18,24,32],hum:[20,30,50,60]},outdoor:{temp:[-10,18,28,35],hum:[15,30,70,90]}},AX={temp:[-30,50],hum:[0,100]},C={temp:['#3d8bfd','#4caf50','#4caf50','#f44336'],hum:['#f44336','#4caf50','#4caf50','#f44336']},L={temp:['Temperature: blue at or below (°C)','Temperature: green from (°C)','Temperature: green to (°C)','Temperature: red at or above (°C)'],hum:['Humidity: red at or below (%)','Humidity: green from (%)','Humidity: green to (%)','Humidity: red at or above (%)']};
+function pct(p,v){var a=AX[p];return Math.max(0,Math.min(100,(v-a[0])*100/(a[1]-a[0])))+'%';}
+function prev(p){var v=[0,1,2,3].map(function(i){return parseFloat(document.getElementById(p+'_rng'+i).value);});document.getElementById(p+'_prev').style.background='linear-gradient(to right,'+C[p][0]+' '+pct(p,v[0])+',#4caf50 '+pct(p,v[1])+',#4caf50 '+pct(p,v[2])+',#f44336 '+pct(p,v[3])+')';}
+['temp','hum'].forEach(function(p){var h='';for(var i=0;i<4;i++)h+='<div class="col-12 col-md-6"><label class="form-label" for="'+p+'_rng'+i+'">'+L[p][i]+'</label><div class="d-flex align-items-center gap-2"><input type="range" class="form-range flex-grow-1" data-for="'+p+'_rng'+i+'" min="'+AX[p][0]+'" max="'+AX[p][1]+'" step="0.5" style="accent-color:'+C[p][i]+'"><input class="form-control mono" style="max-width:6.5rem;border-color:'+C[p][i]+'" type="number" step="0.5" id="'+p+'_rng'+i+'"></div></div>';document.getElementById(p+'_rows').innerHTML=h;});
+function setAll(p,a){for(var i=0;i<4;i++){document.getElementById(p+'_rng'+i).value=a[i];document.querySelector('[data-for="'+p+'_rng'+i+'"]').value=a[i];}prev(p);}
+document.querySelectorAll('[data-for]').forEach(function(s){var n=document.getElementById(s.getAttribute('data-for')),p=n.id.split('_')[0];s.addEventListener('input',function(){n.value=s.value;prev(p);});n.addEventListener('input',function(){s.value=n.value;prev(p);});});
+var sel=document.getElementById('device_location');function apply(){setAll('temp',D[sel.value].temp);setAll('hum',D[sel.value].hum);}sel.addEventListener('change',apply);apply();})();</script>
+          </div>
 
           <!-- WiFi -->
           <div class="col-12"><h3 id="cfgSec1" style="scroll-margin-top:16px" class="h6 text-uppercase text-body-secondary mb-1">WiFi</h3></div>
