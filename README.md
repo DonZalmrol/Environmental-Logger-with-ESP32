@@ -132,6 +132,8 @@ The public page polls `/json` every 3 seconds and updates all values live. It sh
 | CO₂ | ppm |
 | Particulates | PM 1.0, PM 2.5, PM 10 |
 
+Sensor cards carry green-to-red bars (temperature and humidity follow the Indoor/Outdoor ranges). Hidden extra: the Konami code triggers confetti.
+
 ---
 
 ### Admin dashboard (`/admin`)
@@ -183,6 +185,7 @@ A **Jump to section** panel above the setup notes links to each settings section
 | Hostname | `esp32` | Used in browser tab title |
 | NTP server | `pool.ntp.org` | Any reachable NTP host |
 | Station name | `Station Dashboard` | Shown as page heading |
+| Device location | Indoor | Indoor or Outdoor; sets the temperature and humidity bar colour ranges. Each range has a slider and resets to the location defaults when re-selected |
 
 #### Time
 | Setting | Default | Notes |

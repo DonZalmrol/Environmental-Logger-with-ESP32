@@ -582,6 +582,45 @@ static String buildCpmSourceSelectHtml(const char *name, const String &selected)
 String activeNtpServer = String(DEFAULT_NTP_SERVER);
 long activeCpmGaugeFullScale = DEFAULT_CPM_GAUGE_FULL_SCALE;
 String activeStationName = String(DEFAULT_STATION_NAME);
+String activeDeviceLocation = String("indoor");
+// Ranges: {red/blue low, green low, green high, red high}
+float activeTempRange[4] = {16, 18, 24, 32};
+float activeHumRange[4] = {20, 30, 50, 60};
+
+static void getDefaultRanges(bool outdoor, float *t, float *h)
+{
+  static const float tIn[4] = {16, 18, 24, 32}, tOut[4] = {-10, 18, 28, 35};
+  static const float hIn[4] = {20, 30, 50, 60}, hOut[4] = {15, 30, 70, 90};
+  for (int i = 0; i < 4; i++)
+  {
+    t[i] = outdoor ? tOut[i] : tIn[i];
+    h[i] = outdoor ? hOut[i] : hIn[i];
+  }
+}
+
+static bool parseRangeCsv(const String &s, float *out)
+{
+  float v[4];
+  int start = 0;
+  for (int i = 0; i < 4; i++)
+  {
+    int comma = s.indexOf(',', start);
+    if ((i < 3) != (comma >= 0)) return false;
+    String part = s.substring(start, comma >= 0 ? comma : s.length());
+    part.trim();
+    if (part.length() == 0) return false;
+    v[i] = part.toFloat();
+    start = comma + 1;
+  }
+  if (!(v[0] < v[1] && v[1] <= v[2] && v[2] < v[3])) return false;
+  for (int i = 0; i < 4; i++) out[i] = v[i];
+  return true;
+}
+
+static String rangeToCsv(const float *r)
+{
+  return String(r[0], 1) + "," + String(r[1], 1) + "," + String(r[2], 1) + "," + String(r[3], 1);
+}
 bool activeDualTubeEnabled = true;
 uint32_t activeExpSensorMask = DEFAULT_EXP_SENSOR_MASK;
 int activeI2cSdaPin = 21;
@@ -1426,6 +1465,13 @@ static void loadRuntimeSettings(void)
   activeNtpServer = settingsStore.getString("ntp_srv", String(DEFAULT_NTP_SERVER));
   activeCpmGaugeFullScale = (long)settingsStore.getInt("cpm_gauge", (int)DEFAULT_CPM_GAUGE_FULL_SCALE);
   activeStationName = settingsStore.getString("station_name", String(DEFAULT_STATION_NAME));
+  activeDeviceLocation = (settingsStore.getString("loc_type", "indoor") == "outdoor") ? String("outdoor") : String("indoor");
+  getDefaultRanges(activeDeviceLocation == "outdoor", activeTempRange, activeHumRange);
+  {
+    String sfx = (activeDeviceLocation == "outdoor") ? "_out" : "_in";
+    parseRangeCsv(settingsStore.getString((String("trng") + sfx).c_str(), ""), activeTempRange);
+    parseRangeCsv(settingsStore.getString((String("hrng") + sfx).c_str(), ""), activeHumRange);
+  }
   activeDualTubeEnabled = settingsStore.getBool("dual_tube", true);
   activeExpSensorMask = normalizeExpSensorMask((uint32_t)settingsStore.getInt("exp_mask", (int)DEFAULT_EXP_SENSOR_MASK));
   activeI2cSdaPin = settingsStore.getInt("i2c_sda", 21);
@@ -2022,6 +2068,18 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     settingsStore.remove("cpm_gauge");
   }
   saveRuntimeSetting(settingsStore, "station_name", stationNameValue);
+  settingsStore.putString("loc_type", server.arg("device_location") == "outdoor" ? "outdoor" : "indoor");
+  {
+    bool outSel = server.arg("device_location") == "outdoor";
+    float tr[4], hr[4];
+    getDefaultRanges(outSel, tr, hr);
+    String tCsv = server.arg("temp_rng0") + "," + server.arg("temp_rng1") + "," + server.arg("temp_rng2") + "," + server.arg("temp_rng3");
+    String hCsv = server.arg("hum_rng0") + "," + server.arg("hum_rng1") + "," + server.arg("hum_rng2") + "," + server.arg("hum_rng3");
+    parseRangeCsv(tCsv, tr);
+    parseRangeCsv(hCsv, hr);
+    settingsStore.putString(outSel ? "trng_out" : "trng_in", rangeToCsv(tr));
+    settingsStore.putString(outSel ? "hrng_out" : "hrng_in", rangeToCsv(hr));
+  }
   if (hchoPinValue.length() > 0) settingsStore.putInt("hcho_adc_pin", hchoPinValue.toInt()); else settingsStore.remove("hcho_adc_pin");
   if (hvPinValue.length() > 0) settingsStore.putInt("hv_adc_pin", hvPinValue.toInt()); else settingsStore.remove("hv_adc_pin");
   if (i2cSdaPinValue.length() > 0) settingsStore.putInt("i2c_sda", i2cSdaPinValue.toInt()); else settingsStore.remove("i2c_sda");
@@ -3678,6 +3736,40 @@ void handleConfigPath()
 
   body += "<div class='col-12'><h3 class='h6 text-uppercase text-body-secondary mb-1'>General</h3></div>";
   body += "<div class='col-md-6'><label class='form-label' for='station_name'>Station Name</label><input class='form-control' id='station_name' name='station_name' value='" + htmlEscape(displayedStationName) + "'><div class='form-text'>Label shown in the dashboard title. Leave blank to restore the default.</div></div>";
+  body += "<div class='col-md-6'><label class='form-label' for='device_location'>Device Location</label><select class='form-select' id='device_location' name='device_location'><option value='indoor'" + String(activeDeviceLocation == "indoor" ? " selected" : "") + ">Indoor</option><option value='outdoor'" + String(activeDeviceLocation == "outdoor" ? " selected" : "") + ">Outdoor</option></select><div class='form-text'>Selects the dashboard temperature and humidity colour ranges. Applied after reboot.</div></div>";
+  {
+    String rngHtml = "<div class='col-12' id='rangeFields'><h4 class='h6 mb-0'>Bar colour ranges</h4><div class='form-text mb-2'>Dashboard bar colours for the selected location. Re-selecting a location restores its defaults.</div>";
+    const char *tl[4] = {"Temperature: blue at or below (&deg;C)", "Temperature: green from (&deg;C)", "Temperature: green to (&deg;C)", "Temperature: red at or above (&deg;C)"};
+    const char *hl[4] = {"Humidity: red at or below (%)", "Humidity: green from (%)", "Humidity: green to (%)", "Humidity: red at or above (%)"};
+    const char *tc[4] = {"#3d8bfd", "#4caf50", "#4caf50", "#f44336"};
+    const char *hc[4] = {"#f44336", "#4caf50", "#4caf50", "#f44336"};
+    for (int g = 0; g < 2; g++)
+    {
+      const char *p = g == 0 ? "temp" : "hum";
+      rngHtml += String("<div class='mb-3'><div id='") + p + "_prev' style='height:10px;border-radius:5px;margin-bottom:10px'></div><div class='row g-3'>";
+      for (int i = 0; i < 4; i++)
+      {
+        float v = g == 0 ? activeTempRange[i] : activeHumRange[i];
+        rngHtml += String("<div class='col-12 col-md-6'><label class='form-label' for='") + p + "_rng" + String(i) + "'>" + (g == 0 ? tl[i] : hl[i]) + "</label><div class='d-flex align-items-center gap-2'>"
+                   "<input type='range' class='form-range flex-grow-1 rng-slider' data-for='" + p + "_rng" + String(i) + "' min='" + (g == 0 ? "-30" : "0") + "' max='" + (g == 0 ? "50" : "100") + "' step='0.5' value='" + String(v, 1) + "' style='accent-color:" + (g == 0 ? tc[i] : hc[i]) + "'>"
+                   "<input class='form-control mono' style='max-width:6.5rem;border-color:" + (g == 0 ? tc[i] : hc[i]) + "' type='number' step='0.5' id='" + p + "_rng" + String(i) + "' name='" + p + "_rng" + String(i) + "' value='" + String(v, 1) + "'></div></div>";
+      }
+      rngHtml += "</div></div>";
+    }
+    rngHtml += "</div>";
+    rngHtml += "<script>(function(){var D={indoor:{temp:[16,18,24,32],hum:[20,30,50,60]},outdoor:{temp:[-10,18,28,35],hum:[15,30,70,90]}};"
+               "var AX={temp:[-30,50],hum:[0,100]};"
+               "function val(p,i){return parseFloat(document.getElementById(p+'_rng'+i).value);}"
+               "function pct(p,v){var a=AX[p];return Math.max(0,Math.min(100,(v-a[0])*100/(a[1]-a[0])))+'%';}"
+               "function prev(p){var v=[0,1,2,3].map(function(i){return val(p,i);});if(v.some(isNaN))return;var e=p==='temp'?'#3d8bfd':'#f44336';"
+               "document.getElementById(p+'_prev').style.background='linear-gradient(to right,'+e+' '+pct(p,v[0])+',#4caf50 '+pct(p,v[1])+',#4caf50 '+pct(p,v[2])+',#f44336 '+pct(p,v[3])+')';}"
+               "function setAll(p,arr){for(var i=0;i<4;i++){var n=document.getElementById(p+'_rng'+i);n.value=arr[i];var s=document.querySelector(\"[data-for='\"+p+'_rng'+i+\"']\");if(s)s.value=arr[i];}prev(p);}"
+               "document.querySelectorAll('.rng-slider').forEach(function(s){var n=document.getElementById(s.getAttribute('data-for'));var p=n.id.split('_')[0];"
+               "s.addEventListener('input',function(){n.value=s.value;prev(p);});n.addEventListener('input',function(){s.value=n.value;prev(p);});});"
+               "prev('temp');prev('hum');"
+               "var sel=document.getElementById('device_location');if(sel)sel.addEventListener('change',function(){setAll('temp',D[sel.value].temp);setAll('hum',D[sel.value].hum);});})();</script>";
+    body += rngHtml;
+  }
   body += "<div class='col-12'><h3 class='h6 text-uppercase text-body-secondary mb-1'>WiFi</h3></div>";
   body += "<div class='col-md-6'><label class='form-label' for='wifi_ssid'>SSID</label><input class='form-control' id='wifi_ssid' name='wifi_ssid' value='" + htmlEscape(displayedWifiSsid) + "'></div>";
   body += "<div class='col-md-6'><label class='form-label' for='wifi_password'>Password</label><input class='form-control' type='password' id='wifi_password' name='wifi_password' value='' placeholder='" + String(wifiPasswordStored ? "Stored value masked" : "Using default or empty") + "'><div class='form-text'>Leave blank to keep the current password.</div><div class='form-check mt-2'><input class='form-check-input' type='checkbox' id='wifi_password_reset' name='wifi_password_reset'><label class='form-check-label' for='wifi_password_reset'>Reset to compiled default</label></div></div>";
@@ -4890,6 +4982,7 @@ std::vector<String> webPageChunks(bool admin)
       "<div class='card-title'>CPM (2-tube avg, 120 s)</div>"
       "<div id='cpmValue' class='card-value'>" + String(cpm) + "</div>"
       "<div class='card-unit'>counts per minute</div>"
+      "<div class='gauge-bg'><div id='cpmBar' class='gauge-fill'></div></div>"
     "</div>"
     // Tube 1
     + "<div class='card'>"
@@ -4897,6 +4990,7 @@ std::vector<String> webPageChunks(bool admin)
       "<div id='tube1Value' class='card-value'>" + String(actual_cps_1) + "</div>"
       "<div class='card-unit'>counts / s</div>"
       "<div id='tube1DeadtimeInfo' class='card-detail' style='margin-top:6px;font-size:.72rem;color:var(--muted);'>raw " + String(raw_cps_1) + " → corrected " + String(actual_cps_1) + "</div>"
+      "<div class='gauge-bg'><div id='tube1Bar' class='gauge-fill'></div></div>"
     "</div>"
     // Tube 2
     + "<div class='card' id='tube2Card'>"
@@ -4904,18 +4998,21 @@ std::vector<String> webPageChunks(bool admin)
       "<div id='tube2Value' class='card-value'>" + String(actual_cps_2) + "</div>"
       "<div class='card-unit'>counts / s</div>"
       "<div id='tube2DeadtimeInfo' class='card-detail' style='margin-top:6px;font-size:.72rem;color:var(--muted);'>raw " + String(raw_cps_2) + " → corrected " + String(actual_cps_2) + "</div>"
+      "<div class='gauge-bg'><div id='tube2Bar' class='gauge-fill'></div></div>"
     "</div>"
     // Tube 1 CPM
     + "<div class='card'>"
       "<div class='card-title'>Tube 1 CPM</div>"
       "<div id='cpm1Value' class='card-value'>" + String(cpm1) + "</div>"
       "<div class='card-unit'>counts per minute</div>"
+      "<div class='gauge-bg'><div id='cpm1Bar' class='gauge-fill'></div></div>"
     "</div>"
     // Tube 2 CPM
     + "<div class='card' id='cpm2Card'>"
       "<div class='card-title'>Tube 2 CPM</div>"
       "<div id='cpm2Value' class='card-value'>" + String(cpm2) + "</div>"
       "<div class='card-unit'>counts per minute</div>"
+      "<div class='gauge-bg'><div id='cpm2Bar' class='gauge-fill'></div></div>"
     "</div>"
     // Coincidences
     + "<div class='card' id='coincCard'" + String((activeDualTubeEnabled && activeCoincEnabled) ? "" : " style='display:none'") + ">"
@@ -4980,24 +5077,28 @@ std::vector<String> webPageChunks(bool admin)
       "<div class='card-title'>Formaldehyde (CH&#8322;O)</div>"
       "<div id='hchoValue' class='card-value'>" + String(var_hcho, 3) + "</div>"
       "<div class='card-unit'>ppm</div>"
+      "<div class='gauge-bg'><div id='hchoBar' class='gauge-fill'></div></div>"
     "</div>"
     // PM1
     + "<div class='card'>"
       "<div class='card-title'>PM 1.0</div>"
       "<div id='pm01Value' class='card-value'>" + String(var_pm01) + "</div>"
       "<div class='card-unit'>&#xb5;g/m&#179;</div>"
+      "<div class='gauge-bg'><div id='pm01Bar' class='gauge-fill'></div></div>"
     "</div>"
     // PM2.5
     + "<div class='card'>"
       "<div class='card-title'>PM 2.5</div>"
       "<div id='pm25Value' class='card-value'>" + String(var_pm25) + "</div>"
       "<div class='card-unit'>&#xb5;g/m&#179;</div>"
+      "<div class='gauge-bg'><div id='pm25Bar' class='gauge-fill'></div></div>"
     "</div>"
     // PM10
     + "<div class='card'>"
       "<div class='card-title'>PM 10</div>"
       "<div id='pm10Value' class='card-value'>" + String(var_pm10) + "</div>"
       "<div class='card-unit'>&#xb5;g/m&#179;</div>"
+      "<div class='gauge-bg'><div id='pm10Bar' class='gauge-fill'></div></div>"
     "</div>"
     "</div></section>"
   );
@@ -5010,6 +5111,7 @@ std::vector<String> webPageChunks(bool admin)
       "<div class='card-title'>Temperature</div>"
       "<div id='tempValue' class='card-value'>" + String(var_temperature, 1) + "</div>"
       "<div class='card-unit'>&#8451;</div>"
+      "<div class='gauge-bg'><div id='tempBar' class='gauge-fill'></div></div>"
     "</div>"
     // Pressure
     + "<div class='card'>"
@@ -5163,6 +5265,7 @@ std::vector<String> webPageChunks(bool admin)
     + (admin ? "window.Chart=function(){this.data={labels:[],datasets:[]};this.options={plugins:{legend:{labels:{}}},scales:{x:{ticks:{},grid:{}},y:{ticks:{},grid:{}}}};this.update=function(){};};" : "")
     + "const IS_ADMIN=" + String(admin ? "true" : "false") + ";"
     + "const MAX_PTS=60;"
+    + "const DOSE_ALERT_USV=1.0;"
     + "const JSON_URL='" + String(admin ? "/admin/json" : "/json") + "';"
     + "const FAST_POLL_MS=" + String(admin ? "1000" : "3000") + ";"
     + "const THEME_KEY='envLoggerTheme';"
@@ -5205,6 +5308,14 @@ std::vector<String> webPageChunks(bool admin)
     + "function hvColor(voltage){if(voltage<350||voltage>475)return '#f44336';if(voltage>=380&&voltage<=440)return '#4caf50';return '#ff9800';}"
     + "function estimateHvDrivePct(voltage){return clamp(((Number(voltage)||0)-350)*100/125,0,100);}"
     + "function iaqColor(iaq){if(iaq<51)return '#4caf50';if(iaq<101)return '#8bc34a';if(iaq<151)return '#ffc107';if(iaq<201)return '#ff9800';if(iaq<301)return '#f44336';return '#9c27b0';}"
+    + "function setBarHue(id,frac,hue){const n=byId(id);if(!n)return;const f=clamp(Number.isFinite(frac)?frac:0,0,1);n.style.width=Math.max(3,Math.round(f*100))+'%';n.style.background='hsl('+Math.round(hue)+',70%,45%)';}"
+    + "(function(){const K=['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','b','a'];let i=0;"
+    + "function confetti(){const c=document.createElement('canvas');c.style.cssText='position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:9999';c.width=innerWidth;c.height=innerHeight;document.body.appendChild(c);const x=c.getContext('2d');const p=[];"
+    + "for(let k=0;k<180;k++)p.push({x:Math.random()*c.width,y:-20-Math.random()*c.height*0.5,w:6+Math.random()*6,h:8+Math.random()*8,vx:Math.random()*4-2,vy:2+Math.random()*4,r:Math.random()*6,vr:Math.random()*0.3-0.15,c:'hsl('+Math.floor(Math.random()*360)+',90%,60%)'});"
+    + "const t0=performance.now();(function f(t){x.clearRect(0,0,c.width,c.height);p.forEach(function(q){q.x+=q.vx;q.y+=q.vy;q.r+=q.vr;x.save();x.translate(q.x,q.y);x.rotate(q.r);x.fillStyle=q.c;x.fillRect(-q.w/2,-q.h/2,q.w,q.h);x.restore();});"
+    + "if(t-t0<6000&&p.some(function(q){return q.y<c.height+20;}))requestAnimationFrame(f);else c.remove();})(t0);}"
+    + "document.addEventListener('keydown',function(e){const k=e.key.length===1?e.key.toLowerCase():e.key;if(k===K[i]){i++;if(i===K.length){i=0;confetti();}}else{i=(k===K[0])?1:0;}});})();"
+    + "function setBar(id,frac){const n=byId(id);if(!n)return;const f=clamp(Number.isFinite(frac)?frac:0,0,1);n.style.width=Math.max(3,Math.round(f*100))+'%';n.style.background='hsl('+Math.round(120*(1-f))+',70%,45%)';}"
     + "function wifiSignalPct(rssi){const v=Number(rssi);if(!Number.isFinite(v)||v<=-100)return 0;if(v>=-50)return 100;return Math.round(2*(v+100));}"
     + "function wifiBars(pct){return Math.min(4,Math.max(0,Math.floor((pct+24)/25)));}"
     + "function defOpts(label,color){"
@@ -5329,6 +5440,9 @@ std::vector<String> webPageChunks(bool admin)
     + "  else {setText('tube2Value',String(Math.round(tube2)));const raw1=Number(d.rawTube1)||0;const raw2=Number(d.rawTube2)||0;const deadTimeUs=Number(d.tubeDeadTimeUs)||0;const deadTimeFactor1 = raw1>0 ? (1 - (raw1 * deadTimeUs / 1000000)) : 1;const deadTimeFactor2 = raw2>0 ? (1 - (raw2 * deadTimeUs / 1000000)) : 1;if(byId('tube1DeadtimeInfo')) byId('tube1DeadtimeInfo').textContent='raw '+String(raw1)+' -> corrected '+String(Math.round(tube1))+' | factor '+deadTimeFactor1.toFixed(3);if(byId('tube2DeadtimeInfo')) byId('tube2DeadtimeInfo').textContent='raw '+String(raw2)+' -> corrected '+String(Math.round(tube2))+' | factor '+deadTimeFactor2.toFixed(3);}"
     + "  setText('cpm1Value',String(Math.round(Number(d.cpm1)||0)));"
     + "  setText('cpm2Value',String(Math.round(Number(d.cpm2)||0)));"
+    + "  const conv1=Number(d.tubeConversionFactor)||0;const conv2=Number(d.tube2ConversionFactor)||conv1;"
+    + "  setBar('cpmBar',cpm*conv1/DOSE_ALERT_USV);setBar('tube1Bar',tube1*60*conv1/DOSE_ALERT_USV);setBar('tube2Bar',tube2*60*conv2/DOSE_ALERT_USV);"
+    + "  setBar('cpm1Bar',(Number(d.cpm1)||0)*conv1/DOSE_ALERT_USV);setBar('cpm2Bar',(Number(d.cpm2)||0)*conv2/DOSE_ALERT_USV);"
     + "  if(!dualTubeEnabled){if(byId('cpm2Value')) byId('cpm2Value').textContent='0';}"
     + "  const coincCard=byId('coincCard');"
     + "  if(coincCard){coincCard.style.display=d.coincEnabled?'':'none';setText('coincValue',String(Math.round(Number(d.coincPerMin)||0)));setText('coincInfo','accidental est. '+(Number(d.coincAccidentalPerMin)||0).toFixed(2)+' / min');}"
@@ -5383,16 +5497,23 @@ std::vector<String> webPageChunks(bool admin)
     + "  byId('iaqGauge').style.width=clamp(Math.round(iaq*100/500),0,100)+'%';"
     + "  byId('iaqGauge').style.background=iaqCol;"
     + "  setText('co2Value',co2.toFixed(0));"
-    + "  byId('co2Gauge').style.width=clamp(Math.round((co2-400)*100/4600),0,100)+'%';"
+    + "  setBar('co2Gauge',(co2-400)/1600);"
     + "  setText('vocValue',(voc/1000).toFixed(1));"
     + "  setText('hchoValue',hcho.toFixed(3));"
+    + "  setBar('hchoBar',hcho/0.1);"
     + "  setText('pm01Value',String(Math.round(Number(d.pm01)||0)));"
     + "  setText('pm25Value',String(Math.round(Number(d.pm25)||0)));"
     + "  setText('pm10Value',String(Math.round(Number(d.pm10)||0)));"
-    + "  setText('tempValue',(Number(d.temperature)||0).toFixed(1));"
+    + "  setBar('pm01Bar',(Number(d.pm01)||0)/35);setBar('pm25Bar',(Number(d.pm25)||0)/35);setBar('pm10Bar',(Number(d.pm10)||0)/150);"
+    + "  const temp=Number(d.temperature)||0;"
+    + "  setText('tempValue',temp.toFixed(1));"
+    + "  const tr=(Array.isArray(d.tempRange)&&d.tempRange.length===4)?d.tempRange.map(Number):[16,18,24,32];"
+    + "  const tHue=temp<=tr[0]?210:temp<tr[1]?210-90*(temp-tr[0])/(tr[1]-tr[0]):temp<=tr[2]?120:temp<tr[3]?120*(tr[3]-temp)/(tr[3]-tr[2]):0;"
+    + "  setBarHue('tempBar',(temp-(tr[0]-10))/(tr[3]-tr[0]+20),tHue);"
     + "  setText('pressureValue',(Number(d.pressure)||0).toFixed(1));"
     + "  setText('humidityValue',humidity.toFixed(1));"
-    + "  byId('humidityGauge').style.width=clamp(Math.round(humidity),0,100)+'%';"
+    + "  const hr=(Array.isArray(d.humRange)&&d.humRange.length===4)?d.humRange.map(Number):[20,30,50,60];"
+    + "  setBar('humidityGauge',humidity<hr[1]?(hr[1]-humidity)/(hr[1]-hr[0]):(humidity>hr[2]?(humidity-hr[2])/(hr[3]-hr[2]):0));"
     + "  setText('luminosityValue',String(Math.round(Number(d.luminosity)||0)));"
     + "}"
     + "function addPt(chart,label,values){"
@@ -5474,6 +5595,7 @@ String JsonPage(bool admin)
   doc["tubePresetLabel"] = activeTubePresetLabel;
   doc["tubeDeadTimeUs"] = activeTubeDeadTimeSeconds * 1000000.0f;
   doc["tubeConversionFactor"] = activeTubeConversionFactor;
+  doc["tube2ConversionFactor"] = activeTube2ConversionFactor;
   doc["tubeOperatingVoltageMin"] = activeTubeOperatingVoltageMin;
   doc["tubeOperatingVoltageMax"] = activeTubeOperatingVoltageMax;
   doc["tubeOperatingVoltageRange"] = formatOperatingVoltageRange(activeTubeOperatingVoltageMin, activeTubeOperatingVoltageMax);
@@ -5490,6 +5612,12 @@ String JsonPage(bool admin)
   doc["ntpServer"] = activeNtpServer;
   doc["cpmGaugeFullScale"] = (long)activeCpmGaugeFullScale;
   doc["stationName"] = activeStationName;
+  doc["deviceLocation"] = activeDeviceLocation;
+  {
+    JsonArray tr = doc["tempRange"].to<JsonArray>();
+    JsonArray hr = doc["humRange"].to<JsonArray>();
+    for (int i = 0; i < 4; i++) { tr.add(activeTempRange[i]); hr.add(activeHumRange[i]); }
+  }
   doc["loopActivePct"] = loopActivePct;
   doc["cpuLoadCore0Pct"] = cpuLoadCore0Pct;
   doc["cpuLoadCore1Pct"] = cpuLoadCore1Pct;
