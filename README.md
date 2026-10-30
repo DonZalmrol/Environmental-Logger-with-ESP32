@@ -21,6 +21,9 @@ It continuously samples ionising radiation (two GM tubes), air quality (IAQ / CO
 4. [Sensors and Calculations](#sensors-and-calculations)
 5. [CSV History Format](#csv-history-format)
 6. [JSON API (`/json`)](#json-api-json)
+   - [Sensor API (`/api/v1`)](#sensor-api-apiv1)
+   - [Loxone](#loxone)
+   - [WordPress plugin](#wordpress-plugin)
 7. [Upload Platforms](#upload-platforms)
 8. [Tube Presets](#tube-presets)
 9. [Getting Started](#getting-started)
@@ -35,7 +38,7 @@ It continuously samples ionising radiation (two GM tubes), air quality (IAQ / CO
 - **Live web dashboard** — card-grid UI with colour-coded gauge bars for IAQ, CO₂, CPM, humidity and tube HV
 - **Six live Chart.js graphs** on the dashboard — dose rate, CPM (combined + per-tube), CPS (per-tube + moving average), temperature / humidity / pressure, IAQ, CO₂, PM 1.0 / 2.5 / 10
 - **Historical `/graphs` page** — renders the retained on-device CSV history (up to configurable hours) via Chart.js with five full-featured chart cards
-- **Rolling SPIFFS history log** — 16-column CSV sampled every 61 seconds; automatic pruning keeps storage bounded; backward-compatible parser handles 12 / 14 / 16 column files
+- **Rolling SPIFFS history log** — 17-column CSV sampled every 61 seconds; automatic pruning keeps storage bounded; backward-compatible parser handles 12 / 14 / 16 / 17 column files
 - **Fully end-user configurable** — every tunable parameter is accessible from the `/config` page; no firmware rebuild needed; all settings persisted to NVS (Preferences)
 - **Dual-tube dead-time correction** — per-second PCNT hardware counters with configurable dead-time; saturation warning + raw CPS fallback
 - **Nine built-in tube presets** + fully custom dead-time / conversion-factor entry
@@ -86,6 +89,7 @@ Pages are split into **public** (sensor data only) and **admin** (device interna
 | Route | Access | Purpose |
 |-------|--------|---------|
 | `/`, `/graphs`, `/json`, `/history.csv`, `/health` | Public | Sensor dashboard, history graphs, trimmed JSON, CSV, health check |
+| `/api/v1/sensors`, `/api/v1/history`, `/api/v1/loxone` | Public, or API key | Sensors-only API (see [Sensor API](#sensor-api-apiv1)) |
 | `/admin`, `/admin/json` | Admin | Resources, network and upload status |
 | `/config`, `/ota-check`, `/wifi-scan`, `/history-delete`, `/reboot`, `/restart` | Admin | Settings and maintenance |
 | `/update` | Admin | ElegantOTA firmware upload |
@@ -96,6 +100,8 @@ Admin notes:
 - The admin session expires after 15 minutes of inactivity.
 - State-changing requests (POST) must be same-origin (Origin/Referer host must match `Host` or `X-Forwarded-Host`).
 - Behind a reverse proxy (for example Zoraxy), forward the `Authorization` and `Host` headers unchanged.
+- Basic auth is sent in cleartext over plain HTTP. For anyone other than the owner on a trusted LAN, publish the device only through a TLS reverse proxy (for example Zoraxy with a certificate).
+- Every response carries `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy` and a `Content-Security-Policy`.
 - Mockups of every page are in `images/` (open the `.html` files in a browser).
 
 ### Dashboard (`/`)
@@ -163,8 +169,9 @@ The date range shown is determined by the history retention window configured in
 | Air quality | IAQ, CO₂ (ppm) |
 | Particulates | PM 1.0, PM 2.5, PM 10 (µg/m³) |
 | Environment | HV (V), Luminosity (lux), HCHO (ppb), VOC (ppm) |
+| Tube coincidences | Coincidences per minute (shown only when the counter has data) |
 
-Parsed CSV is backward-compatible with all three historical column counts (12, 14, 16).
+Parsed CSV is backward-compatible with all historical column counts (12, 14, 16, 17).
 
 ---
 
@@ -175,7 +182,7 @@ No firmware rebuild is required to change any of these parameters.
 
 ![Config page screenshot](images/config.png)
 
-A **Jump to section** panel above the setup notes links to each settings section. Section order: General, WiFi, Time and Region, Diagnostics, Logging and Display, Radiation Tube Setup, GPIO Mapping, EXP Sensor Selection, Calibration, radmon.org, uRADMonitor.
+A **Jump to section** panel above the setup notes links to each settings section. Section order: General, WiFi, Time and Region, Diagnostics, Logging and Display, Radiation Tube Setup, GPIO Mapping, EXP Sensor Selection, Calibration, radmon.org, uRADMonitor, API access.
 
 #### Network
 | Setting | Default | Notes |
@@ -219,6 +226,11 @@ A **Jump to section** panel above the setup notes links to each settings section
 | radmon.org upload | Enabled | Toggle on / off |
 | uradmonitor upload | Enabled | Toggle on / off |
 | CPM source (per platform) | Combined moving avg (radmon), Tube 1 moving avg (uRADMonitor) | Tube 1 / Tube 2 / combined, raw or moving average |
+
+#### API access
+| Setting | Default | Notes |
+|---------|---------|-------|
+| API key | Empty (open) | View (masked, Show button), set, generate or delete the key for `/api/v1/*`; overrides `SECRET_API_KEY` |
 
 #### History
 | Setting | Default | Notes |
@@ -321,7 +333,7 @@ One row is appended every 61 seconds to `/history_recent.csv` on SPIFFS.
 ```
 epoch,cpm,cps_tube1,cps_tube2,temp_c_x10,humidity_pct_x10,pressure_hpa_x10,
 iaq_x10,co2_ppm,voc_ppm_x100,pm01_ugm3,pm25_ugm3,pm10_ugm3,
-hv_v_x10,luminosity_lux,hcho_ppb
+hv_v_x10,luminosity_lux,hcho_ppb,coinc_per_min
 ```
 
 | Column | Unit / scale | Example |
@@ -342,6 +354,7 @@ hv_v_x10,luminosity_lux,hcho_ppb
 | `hv_v_x10` | volts × 10 | `3923` → 392.3 V |
 | `luminosity_lux` | lux | `47` |
 | `hcho_ppb` | ppb | `12` |
+| `coinc_per_min` | coincidences in the last 60 s | `2` |
 
 The `/history_recent.csv` file and its header can be downloaded at `/history.csv`. Columns of disabled EXP sensors are left empty.  
 The file is deleted via the **Delete History CSV** button on `/config` (`POST /history-delete`, admin login required).
@@ -373,9 +386,48 @@ The file is deleted via the **Delete History CSV** button on `/config` (`POST /h
   "pm10": 6,
   "hcho": 12.0,
   "luminosity": 47,
+  "outputSieverts": 0.027,   // dose rate (uSv/h)
+  "coincEnabled": true,
+  "coincPerMin": 2.0,        // coincidences per minute (two tubes)
+  "coincAccidentalPerMin": 0.1,
+  "dualTubeEnabled": true,
+  "tubePresetLabel": "SBM-19",
+  "tubeDeadTimeUs": 250.0,
+  "tubeConversionFactor": 0.0015,
+  "stationName": "Station Dashboard",
+  "deviceLocation": "indoor",
+  "clock": "12:00:00  |  2026-10-09",
   "unixTime": 1745012345
 }
 ```
+
+### Sensor API (`/api/v1`)
+
+A sensors-only API for other systems. It lists only the sensors enabled in `/config` and never includes network, device or upload details.
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /api/v1/sensors` | JSON: `station`, `epoch` and a `sensors` object. Each sensor has `label`, `unit`, `value` and `dec` (decimal places). Cached 1 s |
+| `GET /api/v1/history` | The history CSV (same as `/history.csv`) |
+| `GET /api/v1/loxone` | Plain text, one `name=value` line per enabled sensor |
+
+Sensor keys: `temperature`, `humidity`, `pressure`, `luminosity`, `iaq`, `voc` (gas resistance, Ohm), `co2`, `hcho`, `pm01`, `pm25`, `pm10`, `totalcpm`, `cpm1`, `cpm2`, `outputSieverts`, `coincPerMin`, `tubeVoltage`.
+
+**API key (optional).** Set a key on the `/config` page (API access section: view, set, generate or delete; stored in NVS) or define `SECRET_API_KEY` in `arduino_secrets.h` as the default. A key set on `/config` overrides the compiled default, and deleting it opens the API. When set, all `/api/v1/*` endpoints require it. Send it as the `X-API-Key` header, or as `?key=` for clients that cannot set headers. If the key is absent or empty the API is open to the local network. `/json` and `/history.csv` are never key-protected, so block them (and the admin routes) at a reverse proxy if the logger is reachable from the internet. Prefer HTTPS at the proxy, because the ESP32 serves plain HTTP and a `?key=` value can appear in logs.
+
+### Loxone
+
+Use a **Virtual HTTP Input** with the address `http://<esp32-ip>/api/v1/loxone` (append `?key=YOURKEY` if a key is set). Add one Virtual HTTP Input command per sensor with command recognition such as `temperature=\v`, `humidity=\v` or `totalcpm=\v`. Use a poll cycle of 10 s or more.
+
+### WordPress plugin
+
+The `wordpress-plugin/` folder holds a lightweight plugin (`esp32-env-logger.zip`, ready to upload under Plugins, Add New, Upload Plugin).
+
+- WordPress fetches the data server-side and caches it, so visitors never contact the ESP32 and the ESP32 sees about one request per cache interval. The WordPress server must be able to reach the logger (LAN, VPN or reverse proxy).
+- Settings, ESP32 Logger: logger base URL (`http://` or the proxy's `https://` address), API key, live cache seconds, default tile refresh and graph cache seconds. An hourly purge, a Clear cache button and a purge on deactivation keep the caches fresh.
+- `[esp32_sensors]` shows live tiles for every enabled sensor. Options: `show="temperature,humidity"`, `charts="temperature,pm25"` (or `all`), `hours="24"` (1, 6, 12, 24, 48, 72 or 168), `height="160"`, `refresh="10"`.
+- `[esp32_graph charts="temperature,humidity" hours="24"]` shows history charts only.
+- The plugin uses the `/api/v1/*` endpoints, so the firmware must include them.
 
 ---
 
@@ -467,6 +519,9 @@ Then edit `arduino_secrets.h`:
 #define SECRET_ADMIN_USER "admin"
 #define SECRET_ADMIN_PASS "use-a-strong-password"
 
+// Optional: require this key on /api/v1/* (X-API-Key header or ?key=).
+// #define SECRET_API_KEY "long-random-string"
+
 // radmon.org
 #define SECRET_USER_NAME    "your_radmon_username"
 #define SECRET_USER_PASS_01 "your_radmon_password"
@@ -526,6 +581,9 @@ Environmental_Stationary_Logger_V1.4/
 │   ├── Seeed_HM330X.h / .cpp                  Local HM3301 PM sensor driver
 │   ├── I2COperations.h / .cpp                 I²C scan helper
 │   └── HM330XErrorCode.h                      PM sensor error codes
+├── wordpress-plugin/
+│   ├── esp32-env-logger/esp32-env-logger.php  WordPress plugin source
+│   └── esp32-env-logger.zip                   Upload-ready plugin package
 └── data/
     └── bsec_iaq.txt                            BSEC state storage reference
 ```
@@ -540,11 +598,15 @@ Environmental_Stationary_Logger_V1.4/
 - WiFi: auto-reconnect and 60 s boot timeout with restart
 - Upload task feeds the watchdog between attempts
 - Admin pages send `X-Frame-Options`; history CSV cached for 30 s
+- Security headers (`nosniff`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, CSP) on all routes; use a TLS reverse proxy for other users because Basic auth is cleartext over HTTP
+- TSL2561 read now times out (20 ms) instead of hanging the main loop and web server when the sensor is missing
 - uRADMonitor version codes moved to named constants
 - Config page: responsive layout, sticky notes panel and action bar, clearer section headings, jump-to-section panel, GPIO cards, calibration section
 - Per-tube profile cards: preset values as text; Custom exposes dead time, conversion factor and operating voltage min/max (persisted per tube)
 - Delete History CSV moved from `/graphs` to the config page
 - Disabled EXP sensors are hidden on the dashboard and `/graphs` and left empty in the history CSV
+- Sensors-only API: `/api/v1/sensors`, `/api/v1/history` and a flat `/api/v1/loxone` for Loxone; optional `SECRET_API_KEY` (`X-API-Key` header or `?key=`); only enabled sensors, no network or device details
+- WordPress plugin added (`wordpress-plugin/`): live sensor tiles and history charts via `[esp32_sensors]` and `[esp32_graph]`, with server-side caching and hourly cache purge
 
 ### v1.4d (2026-04-19) — Dashboard & telemetry expansion
 - Per-tube CPM cards (Tube 1, Tube 2) on dashboard

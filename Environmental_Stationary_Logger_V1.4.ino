@@ -160,7 +160,10 @@ static const char* const FIRMWARE_CHANGELOG =
   "  - Config page: responsive layout, sticky notes panel and\n"
   "    action bar, clearer section headings.\n"
   "  - Admin pages send X-Frame-Options; history CSV is cached 30 s.\n"
-  "  - uRADMonitor version codes moved to named constants.\n\n"
+  "  - uRADMonitor version codes moved to named constants.\n"
+  "  - Sensors-only API: /api/v1/sensors, /api/v1/history and a\n"
+  "    flat /api/v1/loxone; optional SECRET_API_KEY (X-API-Key\n"
+  "    header or ?key=). WordPress plugin included.\n\n"
   "v1.4d  (2026-04-19)  Dashboard & telemetry expansion:\n"
   "  - Per-tube CPM cards (Tube 1 CPM, Tube 2 CPM) on dashboard.\n"
   "  - Live CPM chart: combined + per-tube CPM.\n"
@@ -264,9 +267,14 @@ struct UploadSnapshot {
   unsigned long cpm1;
   unsigned long cpmRadmon;
   unsigned long cpmURad;
+  unsigned long cpmURad2;
   unsigned long actual_cps_1;
   unsigned long actual_cps_2;
   float tubeVoltage;
+  float tubeVoltage2;
+  float hvDuty1Pct;
+  float hvDuty2Pct;
+  float iaq;
   time_t epoch;
   float var_temperature;
   float var_humidity;
@@ -320,6 +328,12 @@ static const bool ADMIN_AUTH_ENABLED = true;
 static const bool ADMIN_AUTH_ENABLED = false;
 #endif
 
+// Optional API key for /api/v1/*: compiled default from SECRET_API_KEY, overridable on /config (NVS "api_key"). Empty leaves the API open on the LAN.
+#ifndef SECRET_API_KEY
+#define SECRET_API_KEY ""
+#endif
+static String activeApiKey = String(SECRET_API_KEY);
+
 // Give up and reboot if WiFi cannot connect within this time at boot.
 #define WIFI_CONNECT_TIMEOUT_MS 60000UL
 
@@ -332,7 +346,7 @@ static uint64_t getUptimeSeconds(void);
 static String formatUptime(uint64_t uptimeSeconds);
 float outputSieverts(float cpmValue);
 static float currentOutputSieverts(void);
-float displayTubeVoltage(void);
+float displayTubeVoltage(int adcPin = -1);
 float calculateHCHO(void);
 static void uploadTaskFunction(void *parameter);
 static void connectToRadMonLogger(UploadSnapshot *snap);
@@ -417,6 +431,9 @@ std::vector<String> webPageChunks(bool admin);
 String JsonPage(bool admin);
 void handleAdminPath();
 void handleAdminJsonPath();
+void handleApiSensorsPath();
+void handleApiLoxonePath();
+void handleApiHistoryPath();
 void handleLogoutPath();
 
 #define VERBOSE_SERIAL_PRINT(...) do { if (serialVerboseEnabled) { Serial.print(__VA_ARGS__); } } while (0)
@@ -449,7 +466,12 @@ enum ExpSensorFlag : uint32_t {
   EXP_SENSOR_WIND_SPEED = 1 << 22,
   EXP_SENSOR_WIND_DIRECTION = 1 << 23,
   EXP_SENSOR_RAIN = 1 << 24,
-  EXP_SENSOR_IRRADIANCE = 1 << 25
+  EXP_SENSOR_IRRADIANCE = 1 << 25,
+  EXP_SENSOR_CPM2 = 1 << 26,
+  EXP_SENSOR_TUBE_TYPE2 = 1 << 27,
+  EXP_SENSOR_HV2 = 1 << 28,
+  EXP_SENSOR_HV_DUTY2 = 1 << 29,
+  EXP_SENSOR_VOC_AQI = 1 << 30
 };
 
 enum class ExpExtraInputMode : uint8_t {
@@ -556,8 +578,10 @@ static const CpmSourceOption CPM_SOURCE_OPTIONS[] = {
 static const size_t CPM_SOURCE_COUNT = sizeof(CPM_SOURCE_OPTIONS) / sizeof(CPM_SOURCE_OPTIONS[0]);
 #define DEFAULT_RADMON_CPM_SOURCE "c_avg"
 #define DEFAULT_URAD_CPM_SOURCE "t1_avg"
+#define DEFAULT_URAD_CPM2_SOURCE "t2_avg"
 String activeRadmonCpmSource = String(DEFAULT_RADMON_CPM_SOURCE);
 String activeURadmonCpmSource = String(DEFAULT_URAD_CPM_SOURCE);
+String activeURadmonCpm2Source = String(DEFAULT_URAD_CPM2_SOURCE);
 
 static String normalizeCpmSource(const String &id, const char *fallback)
 {
@@ -568,9 +592,9 @@ static String normalizeCpmSource(const String &id, const char *fallback)
   return String(fallback);
 }
 
-static String buildCpmSourceSelectHtml(const char *name, const String &selected)
+static String buildCpmSourceSelectHtml(const char *name, const String &selected, const char *label = "CPM source")
 {
-  String html = "<div class='col-md-6'><label class='form-label' for='" + String(name) + "'>CPM source</label><select class='form-select' id='" + String(name) + "' name='" + String(name) + "'>";
+  String html = "<div class='col-md-6'><label class='form-label' for='" + String(name) + "'>" + String(label) + "</label><select class='form-select' id='" + String(name) + "' name='" + String(name) + "'>";
   for (size_t i = 0; i < CPM_SOURCE_COUNT; ++i)
   {
     html += "<option value='" + String(CPM_SOURCE_OPTIONS[i].id) + "'" + (selected == CPM_SOURCE_OPTIONS[i].id ? " selected" : "") + ">" + CPM_SOURCE_OPTIONS[i].label + "</option>";
@@ -627,9 +651,68 @@ int activeI2cSdaPin = 21;
 int activeI2cSclPin = 22;
 int activeHchoAdcPin = 34;
 int activeHvAdcPin = 33;
+int activeHv2AdcPin = -1;   // -1 = not connected
+int activeDuty1Pin = -1;    // PWM drive input of HV inverter 1, -1 = not connected
+int activeDuty2Pin = -1;
 int activeTube1PulsePin = 13;
 int activeTube2PulsePin = 14;
 bool activeCoincEnabled = true;
+
+// Measures the real PWM duty of the HV inverter drive by timing both edges.
+struct DutyMeter
+{
+  int pin;
+  volatile uint32_t highUs;
+  volatile uint32_t lowUs;
+  volatile uint32_t lastEdgeUs;
+  volatile bool level;
+};
+static DutyMeter dutyMeters[2] = {{-1, 0, 0, 0, false}, {-1, 0, 0, 0, false}};
+static portMUX_TYPE dutyMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void IRAM_ATTR dutyEdgeIsr(void *arg)
+{
+  DutyMeter *m = (DutyMeter *)arg;
+  uint32_t now = micros();
+  portENTER_CRITICAL_ISR(&dutyMux);
+  uint32_t dt = now - m->lastEdgeUs;
+  if (m->level) m->highUs += dt; else m->lowUs += dt;
+  m->lastEdgeUs = now;
+  m->level = digitalRead(m->pin);
+  portEXIT_CRITICAL_ISR(&dutyMux);
+}
+
+static void beginDutyMeter(int index, int pin)
+{
+  if (pin < 0) return;
+  DutyMeter &m = dutyMeters[index];
+  m.pin = pin;
+  pinMode(pin, INPUT);
+  m.highUs = 0;
+  m.lowUs = 0;
+  m.level = digitalRead(pin);
+  m.lastEdgeUs = micros();
+  attachInterruptArg(pin, dutyEdgeIsr, &m, CHANGE);
+}
+
+// Returns duty in percent since the previous call and restarts the measurement window.
+static float readDutyPercent(int index)
+{
+  DutyMeter &m = dutyMeters[index];
+  if (m.pin < 0) return 0.0f;
+  uint32_t now = micros();
+  portENTER_CRITICAL(&dutyMux);
+  uint32_t high = m.highUs;
+  uint32_t low = m.lowUs;
+  uint32_t openSegment = now - m.lastEdgeUs;
+  if (m.level) high += openSegment; else low += openSegment;
+  m.highUs = 0;
+  m.lowUs = 0;
+  m.lastEdgeUs = now;
+  portEXIT_CRITICAL(&dutyMux);
+  uint32_t total = high + low;
+  return (total > 0) ? (high * 100.0f / total) : 0.0f;
+}
 uint32_t activeCoincWindowUs = 50;
 
 // Tube coincidence (muon candidate) detection, fed by GPIO ISRs on both tube pins.
@@ -837,6 +920,13 @@ void setup()
 
     pinMode(activeTube1PulsePin, INPUT_PULLUP);
     pinMode(activeTube2PulsePin, INPUT_PULLUP);
+    if (activeHv2AdcPin >= 0)
+    {
+      pinMode(activeHv2AdcPin, INPUT_PULLUP);
+      analogSetPinAttenuation(activeHv2AdcPin, ADC_11db);
+    }
+    beginDutyMeter(0, activeDuty1Pin);
+    beginDutyMeter(1, activeDuty2Pin);
     initializeConfiguredExpInputs();
 
     //pinMode(26, OUTPUT);      // Set pin04 (GPIO26) as output for LED
@@ -1209,9 +1299,14 @@ void loop()
           snap->cpm1            = cpm1;
           snap->cpmRadmon       = selectUploadCpm(activeRadmonCpmSource);
           snap->cpmURad         = selectUploadCpm(activeURadmonCpmSource);
+          snap->cpmURad2        = selectUploadCpm(activeURadmonCpm2Source);
           snap->actual_cps_1    = actual_cps_1;
           snap->actual_cps_2    = actual_cps_2;
           snap->tubeVoltage     = tubeVoltage;
+          snap->tubeVoltage2    = (activeHv2AdcPin >= 0) ? displayTubeVoltage(activeHv2AdcPin) : 0.0f;
+          snap->hvDuty1Pct      = readDutyPercent(0);
+          snap->hvDuty2Pct      = readDutyPercent(1);
+          snap->iaq             = var_iaq;
           snap->epoch           = epoch;
           snap->var_temperature = var_temperature;
           snap->var_humidity    = var_humidity;
@@ -1291,6 +1386,29 @@ void loop()
 //--- START functions ---//
 //----------------------//
 
+// NOTE: Basic auth over plain HTTP is cleartext. For any user other than the owner on a
+// trusted LAN, publish the device only through a TLS reverse proxy (e.g. Zoraxy with a certificate).
+static void applySecurityHeaders(void)
+{
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.sendHeader("X-Frame-Options", "DENY");
+  server.sendHeader("Referrer-Policy", "no-referrer");
+  server.sendHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  server.sendHeader("Content-Security-Policy",
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; "
+    "font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+}
+
+static void secureOn(const char *uri, HTTPMethod method, void (*handler)(void))
+{
+  server.on(uri, method, [handler]() {
+    applySecurityHeaders();
+    handler();
+  });
+}
+
 // Setup WiFi connection
 static void WiFiSetup(void)
 {
@@ -1335,22 +1453,25 @@ static void WiFiSetup(void)
   Serial.println("RSSI = " + String(WiFi.RSSI()) + " dB");
   Serial.println(F("\n"));
 
-  server.on("/", handleRootPath);
-  server.on("/json", handleJsonPath);
-  server.on("/admin", HTTP_GET, handleAdminPath);
-  server.on("/admin/json", HTTP_GET, handleAdminJsonPath);
-  server.on("/logout", HTTP_ANY, handleLogoutPath);
-  server.on("/health", HTTP_ANY, handleHealthPath);
-  server.on("/config", HTTP_GET, handleConfigPath);
-  server.on("/config", HTTP_POST, handleConfigPath);
-  server.on("/reboot", HTTP_POST, handleRebootPath);
-  server.on("/restart", HTTP_POST, handleSimpleRebootPath);
-  server.on("/wifi-scan", HTTP_GET, handleWifiScanPath);
-  server.on("/wifi-scan-page", HTTP_GET, handleWifiScanPagePath);
-  server.on("/graphs", HTTP_GET, handleGraphsPath);
-  server.on("/history.csv", HTTP_GET, handleHistoryCsvPath);
-  server.on("/history-delete", HTTP_POST, handleHistoryDeletePath);
-  server.on("/ota-check", handleOtaCheckPath);
+  secureOn("/", HTTP_ANY, handleRootPath);
+  secureOn("/json", HTTP_ANY, handleJsonPath);
+  secureOn("/api/v1/sensors", HTTP_GET, handleApiSensorsPath);
+  secureOn("/api/v1/loxone", HTTP_GET, handleApiLoxonePath);
+  secureOn("/api/v1/history", HTTP_GET, handleApiHistoryPath);
+  secureOn("/admin", HTTP_GET, handleAdminPath);
+  secureOn("/admin/json", HTTP_GET, handleAdminJsonPath);
+  secureOn("/logout", HTTP_ANY, handleLogoutPath);
+  secureOn("/health", HTTP_ANY, handleHealthPath);
+  secureOn("/config", HTTP_GET, handleConfigPath);
+  secureOn("/config", HTTP_POST, handleConfigPath);
+  secureOn("/reboot", HTTP_POST, handleRebootPath);
+  secureOn("/restart", HTTP_POST, handleSimpleRebootPath);
+  secureOn("/wifi-scan", HTTP_GET, handleWifiScanPath);
+  secureOn("/wifi-scan-page", HTTP_GET, handleWifiScanPagePath);
+  secureOn("/graphs", HTTP_GET, handleGraphsPath);
+  secureOn("/history.csv", HTTP_GET, handleHistoryCsvPath);
+  secureOn("/history-delete", HTTP_POST, handleHistoryDeletePath);
+  secureOn("/ota-check", HTTP_ANY, handleOtaCheckPath);
   if (ADMIN_AUTH_ENABLED)
   {
     ElegantOTA.setAuth(SECRET_ADMIN_USER, SECRET_ADMIN_PASS);
@@ -1359,7 +1480,8 @@ static void WiFiSetup(void)
   {
     Serial.println(F("WARNING: SECRET_ADMIN_PASS not set; /config, /update and admin actions are unauthenticated."));
   }
-  static const char *csrfHeaders[] = {"Origin", "Referer", "Host", "X-Forwarded-Host"};
+  Serial.println(F("NOTE: Basic auth is cleartext over HTTP; expose the device to other users only via a TLS reverse proxy."));
+  static const char *csrfHeaders[] = {"Origin", "Referer", "Host", "X-Forwarded-Host", "X-API-Key"};
   server.collectHeaders(csrfHeaders, sizeof(csrfHeaders) / sizeof(csrfHeaders[0]));
   ElegantOTA.begin(&server);
   server.begin();
@@ -1404,6 +1526,7 @@ static void loadRuntimeSettings(void)
     activeURadmonUploadEnabled = true;
     activeRadmonCpmSource = String(DEFAULT_RADMON_CPM_SOURCE);
     activeURadmonCpmSource = String(DEFAULT_URAD_CPM_SOURCE);
+    activeURadmonCpm2Source = String(DEFAULT_URAD_CPM2_SOURCE);
     activeNtpServer = String(DEFAULT_NTP_SERVER);
     activeCpmGaugeFullScale = DEFAULT_CPM_GAUGE_FULL_SCALE;
     activeStationName = String(DEFAULT_STATION_NAME);
@@ -1413,6 +1536,9 @@ static void loadRuntimeSettings(void)
     activeI2cSclPin = 22;
     activeHchoAdcPin = 34;
     activeHvAdcPin = 33;
+    activeHv2AdcPin = -1;
+    activeDuty1Pin = -1;
+    activeDuty2Pin = -1;
     activeTube1PulsePin = 13;
     activeTube2PulsePin = 14;
     activeCoincEnabled = true;
@@ -1450,6 +1576,7 @@ static void loadRuntimeSettings(void)
   DataSendingPassWord = settingsStore.getString("rad_pass", String(SECRET_USER_PASS_01));
   USER_ID = settingsStore.getString("ur_user", String(SECRET_USER_ID));
   USER_KEY = settingsStore.getString("ur_key", String(SECRET_USER_KEY));
+  activeApiKey = settingsStore.getString("api_key", String(SECRET_API_KEY));
   DEVICE_ID = settingsStore.getString("ur_dev", String(SECRET_DEVICE_ID));
   serialVerboseEnabled = settingsStore.getBool("ser_verbose", true);
   activeTimezoneOffsetMinutes = settingsStore.getInt("tz_offset", DEFAULT_TIMEZONE_OFFSET_MINUTES);
@@ -1462,6 +1589,7 @@ static void loadRuntimeSettings(void)
   activeURadmonUploadEnabled = settingsStore.getBool("urad_en", true);
   activeRadmonCpmSource = normalizeCpmSource(settingsStore.getString("rad_src", DEFAULT_RADMON_CPM_SOURCE), DEFAULT_RADMON_CPM_SOURCE);
   activeURadmonCpmSource = normalizeCpmSource(settingsStore.getString("urad_src", DEFAULT_URAD_CPM_SOURCE), DEFAULT_URAD_CPM_SOURCE);
+  activeURadmonCpm2Source = normalizeCpmSource(settingsStore.getString("urad_src2", DEFAULT_URAD_CPM2_SOURCE), DEFAULT_URAD_CPM2_SOURCE);
   activeNtpServer = settingsStore.getString("ntp_srv", String(DEFAULT_NTP_SERVER));
   activeCpmGaugeFullScale = (long)settingsStore.getInt("cpm_gauge", (int)DEFAULT_CPM_GAUGE_FULL_SCALE);
   activeStationName = settingsStore.getString("station_name", String(DEFAULT_STATION_NAME));
@@ -1478,6 +1606,9 @@ static void loadRuntimeSettings(void)
   activeI2cSclPin = settingsStore.getInt("i2c_scl", 22);
   activeHchoAdcPin = settingsStore.getInt("hcho_adc_pin", 34);
   activeHvAdcPin = settingsStore.getInt("hv_adc_pin", 33);
+  activeHv2AdcPin = settingsStore.getInt("hv2_adc_pin", -1);
+  activeDuty1Pin = settingsStore.getInt("duty1_pin", -1);
+  activeDuty2Pin = settingsStore.getInt("duty2_pin", -1);
   activeTube1PulsePin = settingsStore.getInt("tube1_pin", 13);
   activeTube2PulsePin = settingsStore.getInt("tube2_pin", 14);
   activeCoincEnabled = settingsStore.getBool("coinc_en", true);
@@ -1492,6 +1623,9 @@ static void loadRuntimeSettings(void)
   }
   if (!isValidWroverAnalogInputPin(activeHchoAdcPin)) activeHchoAdcPin = 34;
   if (!isValidWroverAnalogInputPin(activeHvAdcPin)) activeHvAdcPin = 33;
+  if ((activeHv2AdcPin >= 0) && !isValidWroverAnalogInputPin(activeHv2AdcPin)) activeHv2AdcPin = -1;
+  if ((activeDuty1Pin >= 0) && !isValidWroverInputPin(activeDuty1Pin)) activeDuty1Pin = -1;
+  if ((activeDuty2Pin >= 0) && !isValidWroverInputPin(activeDuty2Pin)) activeDuty2Pin = -1;
   if (!isValidWroverInputPin(activeTube1PulsePin)) activeTube1PulsePin = 13;
   if (!isValidWroverInputPin(activeTube2PulsePin)) activeTube2PulsePin = 14;
 
@@ -1662,6 +1796,7 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   String radmonPassword = server.arg("radmon_password");
   String uradUserId = server.arg("urad_user_id");
   String uradUserKey = server.arg("urad_user_key");
+  String apiKeyValue = server.arg("api_key");
   String uradDeviceId = server.arg("urad_device_id");
   String tubePresetId = normalizeTubePresetId(server.arg("tube_preset"));
   String tube2PresetId = server.hasArg("tube2_preset") ? normalizeTubePresetId(server.arg("tube2_preset")) : activeTube2PresetId;
@@ -1691,6 +1826,7 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   bool resetWifiPassword = server.hasArg("wifi_password_reset");
   bool resetRadmonPassword = server.hasArg("radmon_password_reset");
   bool resetURadUserKey = server.hasArg("urad_user_key_reset");
+  bool deleteApiKey = server.hasArg("api_key_delete");
   bool serialVerbose = server.hasArg("serial_verbose");
   bool radmonUploadEnabled = server.hasArg("radmon_upload_enabled");
   bool uradmonUploadEnabled = server.hasArg("urad_upload_enabled");
@@ -1743,8 +1879,13 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   if (server.hasArg("exp_sensor_ch2o")) requestedExpSensorMask |= EXP_SENSOR_CH2O;
   if (server.hasArg("exp_sensor_pm25")) requestedExpSensorMask |= EXP_SENSOR_PM25;
   if (server.hasArg("exp_sensor_cpm")) requestedExpSensorMask |= EXP_SENSOR_CPM;
+  if (server.hasArg("exp_sensor_cpm2")) requestedExpSensorMask |= EXP_SENSOR_CPM2;
+  if (server.hasArg("exp_sensor_tube_type2")) requestedExpSensorMask |= EXP_SENSOR_TUBE_TYPE2;
   if (server.hasArg("exp_sensor_hv")) requestedExpSensorMask |= EXP_SENSOR_HV;
   if (server.hasArg("exp_sensor_hv_duty")) requestedExpSensorMask |= EXP_SENSOR_HV_DUTY;
+  if (server.hasArg("exp_sensor_hv2")) requestedExpSensorMask |= EXP_SENSOR_HV2;
+  if (server.hasArg("exp_sensor_hv_duty2")) requestedExpSensorMask |= EXP_SENSOR_HV_DUTY2;
+  if (server.hasArg("exp_sensor_voc_aqi")) requestedExpSensorMask |= EXP_SENSOR_VOC_AQI;
   if (server.hasArg("exp_sensor_tube_type")) requestedExpSensorMask |= EXP_SENSOR_TUBE_TYPE;
   if (server.hasArg("exp_sensor_pm1")) requestedExpSensorMask |= EXP_SENSOR_PM1;
   if (server.hasArg("exp_sensor_pm10")) requestedExpSensorMask |= EXP_SENSOR_PM10;
@@ -1897,6 +2038,22 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     noticeClass = "danger";
     return false;
   }
+  if ((server.arg("hv2_adc_pin").toInt() >= 0) && server.arg("hv2_adc_pin").length() > 0 && !isValidWroverAnalogInputPin(server.arg("hv2_adc_pin").toInt()))
+  {
+    notice = "Tube 2 high-voltage ADC pin is outside the ESP32 Wrover-E ADC1 range.";
+    noticeClass = "danger";
+    return false;
+  }
+  for (const char *dutyArg : {"duty1_pin", "duty2_pin"})
+  {
+    int dutyPin = server.arg(dutyArg).toInt();
+    if ((dutyPin >= 0) && server.arg(dutyArg).length() > 0 && !isValidWroverInputPin(dutyPin))
+    {
+      notice = "HV duty input pin is outside the ESP32 Wrover-E supported GPIO list.";
+      noticeClass = "danger";
+      return false;
+    }
+  }
   if ((i2cSdaPinValue.length() > 0) && !isValidWroverI2cPin(i2cSdaPinValue.toInt()))
   {
     notice = "I2C SDA pin must be an output-capable ESP32 Wrover-E GPIO.";
@@ -2009,11 +2166,28 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
     settingsStore.putString("ur_key", uradUserKey);
   }
   saveRuntimeSetting(settingsStore, "ur_dev", uradDeviceId);
+  // Empty string is stored on delete so the compiled default does not come back.
+  if (deleteApiKey)
+  {
+    settingsStore.putString("api_key", "");
+  }
+  else
+  {
+    apiKeyValue.trim();
+    bool apiKeyValid = apiKeyValue.length() > 0 && apiKeyValue.length() <= 64;
+    for (size_t i = 0; apiKeyValid && i < apiKeyValue.length(); i++)
+    {
+      const char c = apiKeyValue[i];
+      apiKeyValid = isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.';
+    }
+    if (apiKeyValid) settingsStore.putString("api_key", apiKeyValue);
+  }
   settingsStore.putBool("ser_verbose", serialVerbose);
   settingsStore.putBool("rad_en", radmonUploadEnabled);
   settingsStore.putBool("urad_en", uradmonUploadEnabled);
   settingsStore.putString("rad_src", normalizeCpmSource(server.arg("radmon_cpm_source"), activeRadmonCpmSource.c_str()));
   settingsStore.putString("urad_src", normalizeCpmSource(server.arg("urad_cpm_source"), activeURadmonCpmSource.c_str()));
+  settingsStore.putString("urad_src2", normalizeCpmSource(server.arg("urad_cpm2_source"), activeURadmonCpm2Source.c_str()));
   settingsStore.putBool("dual_tube", dualTubeEnabled);
   settingsStore.putBool("coinc_en", coincEnabled);
   settingsStore.putUInt("coinc_win", coincWindow);
@@ -2082,6 +2256,9 @@ static bool saveRuntimeSettingsFromRequest(String &notice, String &noticeClass)
   }
   if (hchoPinValue.length() > 0) settingsStore.putInt("hcho_adc_pin", hchoPinValue.toInt()); else settingsStore.remove("hcho_adc_pin");
   if (hvPinValue.length() > 0) settingsStore.putInt("hv_adc_pin", hvPinValue.toInt()); else settingsStore.remove("hv_adc_pin");
+  settingsStore.putInt("hv2_adc_pin", server.hasArg("hv2_adc_pin") ? server.arg("hv2_adc_pin").toInt() : activeHv2AdcPin);
+  settingsStore.putInt("duty1_pin", server.hasArg("duty1_pin") ? server.arg("duty1_pin").toInt() : activeDuty1Pin);
+  settingsStore.putInt("duty2_pin", server.hasArg("duty2_pin") ? server.arg("duty2_pin").toInt() : activeDuty2Pin);
   if (i2cSdaPinValue.length() > 0) settingsStore.putInt("i2c_sda", i2cSdaPinValue.toInt()); else settingsStore.remove("i2c_sda");
   if (i2cSclPinValue.length() > 0) settingsStore.putInt("i2c_scl", i2cSclPinValue.toInt()); else settingsStore.remove("i2c_scl");
   if (tube1PinValue.length() > 0) settingsStore.putInt("tube1_pin", tube1PinValue.toInt()); else settingsStore.remove("tube1_pin");
@@ -2190,7 +2367,7 @@ static String normalizeTubePresetId(const String &presetId)
 
 static uint32_t normalizeExpSensorMask(const uint32_t &sensorMask)
 {
-  uint32_t normalized = sensorMask & 0x3FFFFFFUL;
+  uint32_t normalized = sensorMask & 0x7FFFFFFFUL;
   if (normalized == 0)
   {
     return DEFAULT_EXP_SENSOR_MASK;
@@ -2540,7 +2717,8 @@ static String changelogDialogHtml()
 {
   String html;
   html += "<style>#changelogDlg::backdrop{background:rgba(0,0,0,.65);backdrop-filter:blur(4px);}</style>";
-  html += "<dialog id='changelogDlg' style='background:var(--card);border:1px solid var(--border);border-radius:18px;padding:24px;max-width:700px;width:90vw;max-height:80vh;overflow-y:auto;color:var(--text);'>";
+  html += "<dialog id='changelogDlg' style='background:var(--card);border:1px solid var(--border);border-radius:18px;padding:0;margin:auto;max-width:700px;width:90vw;max-height:80vh;overflow-y:auto;color:var(--text);'>";
+  html += "<div style='padding:24px;'>";
   html += "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;'>";
   html += "<strong style='font-size:1rem;'>Firmware Changelog</strong>";
   html += "<button onclick='document.getElementById(\"changelogDlg\").close()' style='background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.4rem;line-height:1;'>&#10005;</button>";
@@ -2548,7 +2726,9 @@ static String changelogDialogHtml()
   html += "<pre style='white-space:pre-wrap;font-size:.79rem;color:var(--muted);line-height:1.7;margin:0;'>";
   html += FIRMWARE_CHANGELOG;
   html += "</pre>";
+  html += "</div>";
   html += "</dialog>";
+  html += "<script>(function(){var d=document.getElementById('changelogDlg');if(d){d.addEventListener('click',function(e){if(e.target===d){d.close();}});}})();</script>";
   return html;
 }
 
@@ -2559,7 +2739,6 @@ static String adminPageShell(const String &title, const String &subtitle, const 
   uint64_t uptimeSeconds = getUptimeSeconds();
   String shell;
 
-  server.sendHeader("X-Frame-Options", "DENY");
   shell.reserve(body.length() + 5900);
   shell += "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   shell += "<link rel='icon' type='image/svg+xml' href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9762;</text></svg>\">";
@@ -2673,10 +2852,10 @@ static float currentOutputSieverts(void)
 }
 
 // Measure Tube voltage through A0
-float displayTubeVoltage(void)
+float displayTubeVoltage(int adcPin)
 {
   float adcInput = 0.0, lowVoltage = 0.0, voltage_offset = 0.0, highVoltage = 0.0;
-  adcInput = (float)analogRead(activeHvAdcPin);
+  adcInput = (float)analogRead(adcPin >= 0 ? adcPin : activeHvAdcPin);
 
   // The configured Wrover-E ADC input measures from 0-3.3V and spans 0-4095 counts.
   // Use 3.4 and 4096 as correcting values for the divider and ADC target range.
@@ -2874,7 +3053,6 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
   UploadRecord currentUpload = {};
   copyUploadRecord(currentUpload, snap);
   currentUpload.cpm = snap->cpmURad;
-  float estimatedDrivePct = estimateHvDriveUploadPct(snap->tubeVoltage);
 
   if (!activeURadmonUploadEnabled)
   {
@@ -2964,16 +3142,40 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
     ptr += snap->cpmURad;         // CPM from the selected source
   }
 
+  if (activeDualTubeEnabled && isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_CPM2))
+  {
+    ptr += "/1B/";                // 1B = optional: radiation of the 2nd detector in cpm
+    ptr += snap->cpmURad2;
+  }
+
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV))
   {
     ptr += "/0C/";                // 0C = optional: high voltage geiger tube inverter voltage in volts
     ptr += snap->tubeVoltage;     // tube voltage value
   }
 
-  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV_DUTY))
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV_DUTY) && (activeDuty1Pin >= 0))
   {
-    ptr += "/0D/";                // 0D = estimated HV drive index in %, derived from measured tube voltage
-    ptr += estimatedDrivePct;
+    ptr += "/0D/";                // 0D = measured PWM duty of HV inverter 1, in %
+    ptr += String(snap->hvDuty1Pct, 1);
+  }
+
+  if (activeDualTubeEnabled && isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV2) && (activeHv2AdcPin >= 0))
+  {
+    ptr += "/1C/";                // 1C = optional: inverter voltage of the 2nd detector
+    ptr += snap->tubeVoltage2;
+  }
+
+  if (activeDualTubeEnabled && isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HV_DUTY2) && (activeDuty2Pin >= 0))
+  {
+    ptr += "/1D/";                // 1D = measured PWM duty of HV inverter 2, in %
+    ptr += String(snap->hvDuty2Pct, 1);
+  }
+
+  if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_VOC_AQI))
+  {
+    ptr += "/1F/";                // 1F = VOC AQI 0-500 (BSEC IAQ)
+    ptr += String((int)lroundf(snap->iaq));
   }
 
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_HARDWARE_VERSION))
@@ -2992,6 +3194,12 @@ static void connectToURadMonLogger(UploadSnapshot *snap)
   {
     ptr += "/10/";                // 10 = optional: tube type ID (uRADMonitor EXP detector enum)
     ptr += String(getUradTubeTypeId(activeTubePresetId));
+  }
+
+  if (activeDualTubeEnabled && isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_TUBE_TYPE2))
+  {
+    ptr += "/1E/";                // 1E = optional: tube type ID of the 2nd detector
+    ptr += String(getUradTubeTypeId(activeTube2PresetId));
   }
 
   if (isExpSensorEnabled(activeExpSensorMask, EXP_SENSOR_PM1))
@@ -3464,6 +3672,105 @@ void handleJsonPath()
   server.send(200, "application/json", cachedJson);
 }
 
+// Constant-time compare so the key can't be recovered through response timing.
+// The key is accepted as X-API-Key header or ?key= (for clients such as Loxone that cannot set headers).
+static bool requireApiKey()
+{
+  if (activeApiKey.length() == 0) return true;
+  const String given = server.hasHeader("X-API-Key") ? server.header("X-API-Key") : server.arg("key");
+  const String expected = activeApiKey;
+  uint8_t diff = (given.length() != expected.length()) ? 1 : 0;
+  for (size_t i = 0; i < expected.length(); i++)
+  {
+    diff |= (uint8_t)(expected[i] ^ (i < given.length() ? given[i] : 0));
+  }
+  if (diff != 0)
+  {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(401, "application/json", "{\"error\":\"invalid or missing API key\"}");
+    return false;
+  }
+  return true;
+}
+
+// Public, sensors-only JSON: only enabled readings, no network, device or upload details.
+static const String &apiSensorsJson()
+{
+  static String cachedApi;
+  static uint32_t cachedApiAtMs = 0;
+  const uint32_t nowMs = millis();
+  if (cachedApi.length() == 0 || (uint32_t)(nowMs - cachedApiAtMs) >= 1000U)
+  {
+    JsonDocument d;
+    d["station"] = activeStationName;
+    d["epoch"] = (unsigned long)ntp.epoch();
+    JsonObject s = d["sensors"].to<JsonObject>();
+    auto add = [&](bool enabled, const char *key, const char *label, const char *unit, float value, int dec) {
+      if (!enabled) return;
+      JsonObject o = s[key].to<JsonObject>();
+      o["label"] = label;
+      o["unit"] = unit;
+      o["value"] = value;
+      o["dec"] = dec;
+    };
+    auto on = [](uint32_t flag) { return isExpSensorEnabled(activeExpSensorMask, flag); };
+    add(on(EXP_SENSOR_TEMPERATURE), "temperature", "Temperature", "degC", var_temperature, 1);
+    add(on(EXP_SENSOR_HUMIDITY), "humidity", "Humidity", "%", var_humidity, 1);
+    add(on(EXP_SENSOR_PRESSURE), "pressure", "Pressure", "hPa", var_pressure / 100.0f, 1);
+    add(on(EXP_SENSOR_ILLUMINANCE), "luminosity", "Light", "lux", luminosity, 0);
+    add(on(EXP_SENSOR_VOC), "iaq", "IAQ", "", var_iaq, 0);
+    add(on(EXP_SENSOR_VOC), "voc", "Gas resistance", "Ohm", var_voc, 0);
+    add(on(EXP_SENSOR_CO2), "co2", "CO2 equivalent", "ppm", var_co2, 0);
+    add(on(EXP_SENSOR_CH2O), "hcho", "HCHO", "ppb", var_hcho, 1);
+    add(on(EXP_SENSOR_PM1), "pm01", "PM1.0", "ug/m3", var_pm01, 0);
+    add(on(EXP_SENSOR_PM25), "pm25", "PM2.5", "ug/m3", var_pm25, 0);
+    add(on(EXP_SENSOR_PM10), "pm10", "PM10", "ug/m3", var_pm10, 0);
+    add(on(EXP_SENSOR_CPM), "totalcpm", "Radiation", "CPM", cpm, 0);
+    add(on(EXP_SENSOR_CPM) && activeDualTubeEnabled, "cpm1", "Tube 1", "CPM", cpm1, 0);
+    add(on(EXP_SENSOR_CPM) && activeDualTubeEnabled, "cpm2", "Tube 2", "CPM", cpm2, 0);
+    add(on(EXP_SENSOR_CPM), "outputSieverts", "Dose rate", "uSv/h", currentOutputSieverts(), 3);
+    add(on(EXP_SENSOR_CPM) && activeDualTubeEnabled && activeCoincEnabled, "coincPerMin", "Coincidences", "/min", coincPerMin, 1);
+    add(on(EXP_SENSOR_HV), "tubeVoltage", "Tube voltage", "V", tubeVoltage, 0);
+    cachedApi = "";
+    serializeJson(d, cachedApi);
+    cachedApiAtMs = nowMs;
+  }
+  return cachedApi;
+}
+
+void handleApiSensorsPath()
+{
+  if (!requireApiKey()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", apiSensorsJson());
+}
+
+// Flat "name=value" lines for Loxone Virtual HTTP Input command recognition (e.g. "temperature=\v").
+void handleApiLoxonePath()
+{
+  if (!requireApiKey()) return;
+  JsonDocument d;
+  String out;
+  if (deserializeJson(d, apiSensorsJson()) == DeserializationError::Ok)
+  {
+    for (JsonPair kv : d["sensors"].as<JsonObject>())
+    {
+      out += kv.key().c_str();
+      out += '=';
+      out += String(kv.value()["value"].as<float>(), kv.value()["dec"].as<int>());
+      out += '\n';
+    }
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain; charset=utf-8", out);
+}
+
+void handleApiHistoryPath()
+{
+  if (!requireApiKey()) return;
+  handleHistoryCsvPath();
+}
+
 // JSON map of which EXP-controlled readings are enabled; used by the dashboard and graphs to hide disabled ones.
 static String buildExpEnabledJson()
 {
@@ -3799,7 +4106,7 @@ void handleConfigPath()
   body += "<div class='col-md-4'><label class='form-label' for='coinc_window'>Coincidence window (us)</label><input class='form-control mono' type='number' min='5' max='1000' id='coinc_window' name='coinc_window' value='" + String(activeCoincWindowUs) + "'><div class='form-text'>5 - 1000, default 50.</div></div>";
   body += "<div class='col-12' id='tube2ProfileSection'" + String(activeDualTubeEnabled ? "" : " style='display:none'") + "><div class='row g-3'><div class='col-12'><h4 class='h6 mb-0'>Tube 2</h4></div>";
   body += "<div class='col-md-6'><label class='form-label' for='tube2_preset'>Tube 2 Type</label><select class='form-select' id='tube2_preset' name='tube2_preset'" + String(activeDualTubeEnabled ? "" : " disabled") + ">" + buildTubePresetOptionsHtml(displayedTube2PresetId) + "</select><div class='form-text'>Tube 2 uses its own dead time and dose conversion. EXP field 10 still reports Tube 1.</div></div>";
-  body += buildTubeProfileCardHtml("tube2", "Active Tube 2 profile", activeTube2PresetLabel, formatExpTubeTypeCode(getUradTubeTypeId(displayedTube2PresetId)), displayedTube2VoltageRange, displayedTube2Note, displayedTube2DeadTimeUs, displayedTube2ConversionFactor, displayedTube2VMin, displayedTube2VMax, displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID, activeDualTubeEnabled, "EXP field 10 reports Tube 1 only.");
+  body += buildTubeProfileCardHtml("tube2", "Active Tube 2 profile", activeTube2PresetLabel, formatExpTubeTypeCode(getUradTubeTypeId(displayedTube2PresetId)), displayedTube2VoltageRange, displayedTube2Note, displayedTube2DeadTimeUs, displayedTube2ConversionFactor, displayedTube2VMin, displayedTube2VMax, displayedTube2PresetId == CUSTOM_TUBE_PRESET_ID, activeDualTubeEnabled, "EXP field 1E reports the Tube 2 type.");
   body += "</div></div>";
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>ESP32 Wrover-E GPIO Mapping</h3></div>";
   String sharedI2cSummary = "GPIO" + String(activeI2cSdaPin) + " / GPIO" + String(activeI2cSclPin);
@@ -3818,6 +4125,15 @@ void handleConfigPath()
   body += "<select id='tube1_pin' name='tube1_pin'>" + buildEsp32PinOptionsHtml(displayedTube1Pin, (const int[]){4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39}, 22, false) + "</select>";
   body += "<select id='tube2_pin' name='tube2_pin'>" + buildEsp32PinOptionsHtml(displayedTube2Pin, (const int[]){4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39}, 22, false) + "</select></div>";
   body += "<div class='col-12'>" + buildI2cDiscoveryHtml() + "</div>";
+  {
+    static const int hvPins[] = {32, 33, 34, 35, 36, 39};
+    static const int dutyPins[] = {4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39};
+    String none = "<option value='-1'" + String(activeHv2AdcPin < 0 ? " selected" : "") + ">Not connected</option>";
+    body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>HV inverter inputs</h3><div class='form-text'>PWM duty is measured from the inverter drive signal (3.3 V logic only). Without a duty pin the 0D / 1D fields are not uploaded. Reboot after changing.</div></div>";
+    body += "<div class='col-md-4'><label class='form-label' for='duty1_pin'>Tube 1 duty (PWM) input</label><select class='form-select' id='duty1_pin' name='duty1_pin'><option value='-1'" + String(activeDuty1Pin < 0 ? " selected" : "") + ">Not connected</option>" + buildEsp32PinOptionsHtml(String(activeDuty1Pin), dutyPins, 22, false) + "</select></div>";
+    body += "<div class='col-md-4'><label class='form-label' for='hv2_adc_pin'>Tube 2 voltage ADC</label><select class='form-select' id='hv2_adc_pin' name='hv2_adc_pin'>" + none + buildEsp32PinOptionsHtml(String(activeHv2AdcPin), hvPins, 6, true) + "</select></div>";
+    body += "<div class='col-md-4'><label class='form-label' for='duty2_pin'>Tube 2 duty (PWM) input</label><select class='form-select' id='duty2_pin' name='duty2_pin'><option value='-1'" + String(activeDuty2Pin < 0 ? " selected" : "") + ">Not connected</option>" + buildEsp32PinOptionsHtml(String(activeDuty2Pin), dutyPins, 22, false) + "</select></div>";
+  }
   body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>EXP Sensor Selection</h3></div>";
   body += "<div class='col-12'><div class='border rounded-3 p-3 bg-body-tertiary'><div class='fw-semibold mb-2'>Enable EXP sensor fields</div><div class='row g-4'>";
   body += "<div class='col-12'><div class='row row-cols-1 row-cols-md-2 g-2'>";
@@ -3839,8 +4155,13 @@ void handleConfigPath()
     addToggle(0x08, "exp_sensor_ch2o", "CH2O / HCHO (08)", EXP_SENSOR_CH2O, "hcho_adc_pin", "GPIO" + String(activeHchoAdcPin));
     addToggle(0x09, "exp_sensor_pm25", "PM2.5 (09)", EXP_SENSOR_PM25, "i2c", sharedI2cSummary);
     addToggle(0x0B, "exp_sensor_cpm", "Tube 1 CPM (0B)", EXP_SENSOR_CPM, "tube1_pin", "GPIO" + String(activeTube1PulsePin));
+    addToggle(0x1B, "exp_sensor_cpm2", "Tube 2 CPM (1B)", EXP_SENSOR_CPM2, "tube2_pin", "GPIO" + String(activeTube2PulsePin));
+    addPlain(0x1E, "exp_sensor_tube_type2", "Tube 2 type ID (1E)", EXP_SENSOR_TUBE_TYPE2);
     addToggle(0x0C, "exp_sensor_hv", "Tube voltage (0C)", EXP_SENSOR_HV, "hv_adc_pin", "GPIO" + String(activeHvAdcPin));
-    addToggle(0x0D, "exp_sensor_hv_duty", "HV duty cycle (0D)", EXP_SENSOR_HV_DUTY, "hv_adc_pin", "GPIO" + String(activeHvAdcPin));
+    addPlain(0x0D, "exp_sensor_hv_duty", "HV duty cycle, measured PWM (0D)", EXP_SENSOR_HV_DUTY);
+    addPlain(0x1C, "exp_sensor_hv2", "Tube 2 voltage (1C)", EXP_SENSOR_HV2);
+    addPlain(0x1D, "exp_sensor_hv_duty2", "Tube 2 HV duty cycle (1D)", EXP_SENSOR_HV_DUTY2);
+    addToggle(0x1F, "exp_sensor_voc_aqi", "VOC AQI (1F)", EXP_SENSOR_VOC_AQI, "i2c", sharedI2cSummary);
     addPlain(0x0E, "exp_sensor_hardware_version", "Hardware version (0E)", EXP_SENSOR_HARDWARE_VERSION);
     addPlain(0x0F, "exp_sensor_firmware_version", "Firmware version (0F)", EXP_SENSOR_FIRMWARE_VERSION);
     addPlain(0x10, "exp_sensor_tube_type", "Tube type ID (10)", EXP_SENSOR_TUBE_TYPE);
@@ -3897,7 +4218,11 @@ void handleConfigPath()
   body += "<div class='col-md-4'><label class='form-label' for='urad_user_id'>User ID</label><input class='form-control' id='urad_user_id' name='urad_user_id' value='" + htmlEscape(USER_ID) + "'></div>";
   body += "<div class='col-md-4'><label class='form-label' for='urad_user_key'>User Key</label><input class='form-control' type='password' id='urad_user_key' name='urad_user_key' value='' placeholder='" + String(uradKeyStored ? "Stored value masked" : "Using default or empty") + "'><div class='form-text'>Leave blank to keep the current key.</div><div class='form-check mt-2'><input class='form-check-input' type='checkbox' id='urad_user_key_reset' name='urad_user_key_reset'><label class='form-check-label' for='urad_user_key_reset'>Reset to compiled default</label></div></div>";
   body += "<div class='col-md-4'><label class='form-label' for='urad_device_id'>Device ID</label><input class='form-control' id='urad_device_id' name='urad_device_id' value='" + htmlEscape(DEVICE_ID) + "'></div>";
-  body += buildCpmSourceSelectHtml("urad_cpm_source", activeURadmonCpmSource);
+  body += buildCpmSourceSelectHtml("urad_cpm_source", activeURadmonCpmSource, "Tube 1 CPM source (0B)");
+  body += buildCpmSourceSelectHtml("urad_cpm2_source", activeURadmonCpm2Source, "Tube 2 CPM source (1B)");
+
+  body += "<div class='col-12 pt-2'><h3 class='h6 text-uppercase text-body-secondary mb-1'>API access (/api/v1/*)</h3></div>";
+  body += "<div class='col-md-8'><label class='form-label' for='api_key'>API Key</label><div class='input-group'><input class='form-control' type='password' id='api_key' name='api_key' maxlength='64' autocomplete='off' value='" + htmlEscape(activeApiKey) + "' placeholder='No key set - API is open on the LAN'><button type='button' class='btn btn-outline-secondary' onclick=\"var f=document.getElementById('api_key');f.type=f.type==='password'?'text':'password'\">Show</button><button type='button' class='btn btn-outline-secondary' onclick=\"var a=new Uint8Array(16);crypto.getRandomValues(a);var f=document.getElementById('api_key');f.value=Array.from(a,function(b){return b.toString(16).padStart(2,'0')}).join('');f.type='text';document.getElementById('api_key_delete').checked=false\">Generate</button></div><div class='form-text'>Letters, digits, - _ . only (max 64). Sent as X-API-Key header or ?key=. Empty means no key is required.</div><div class='form-check mt-2'><input class='form-check-input' type='checkbox' id='api_key_delete' name='api_key_delete'><label class='form-check-label' for='api_key_delete'>Delete key (open API)</label></div></div>";
 
   body += "<div class='col-12 d-flex flex-wrap gap-2 pt-2 cfg-actions'><button type='submit' class='btn btn-primary'>Save Settings</button><button type='submit' formaction='/reboot' formmethod='post' class='btn btn-warning'>Save and Reboot</button><button type='submit' formaction='/restart' formmethod='post' class='btn btn-outline-secondary'>Reboot Only</button><a class='btn btn-outline-secondary' href='/ota-check'>Review OTA Status</a><a class='btn btn-outline-secondary' href='/update'>Open OTA Update</a></div>";
   body += "<dialog id='hardwarePinSetupDialog' style='background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:560px;width:92vw;color:var(--text);'><h3 class='h5' id='hardwarePinSetupTitle'>Configure sensor pins</h3><p class='hint' id='hardwarePinSetupHelp'></p>";
@@ -4154,6 +4479,20 @@ void handleGraphsPath()
   server.send(200, "text/html; charset=utf-8", adminPageShell("Graphs", "Historical CSV graphs stored locally on SPIFFS.", body));
 }
 
+static String buildRebootWaitHtml(void)
+{
+  String html = "<div class='alert alert-info mb-0 mt-3'>Waiting for the device: <strong id='rebootStatus'></strong></div>";
+  html += "<script>(function(){var n=10,tries=0,st=document.getElementById('rebootStatus');"
+          "function probe(){tries++;st.textContent='trying to reach the device (attempt '+tries+')...';"
+          "var c=new AbortController(),t=setTimeout(function(){c.abort();},2500);"
+          "fetch('/config?ts='+Date.now(),{cache:'no-store',signal:c.signal}).then(function(){clearTimeout(t);st.textContent='device is back, reloading...';location.href='/config';})"
+          ".catch(function(){clearTimeout(t);n=5;tick();});}"
+          "function tick(){st.textContent='retrying in '+n+' s (attempt '+(tries+1)+')';"
+          "var iv=setInterval(function(){n--;if(n<=0){clearInterval(iv);probe();}else{st.textContent='retrying in '+n+' s (attempt '+(tries+1)+')';}},1000);}"
+          "tick();})();</script>";
+  return html;
+}
+
 void handleRebootPath()
 {
   if (!requireAdminAuth()) return;
@@ -4179,6 +4518,7 @@ void handleRebootPath()
   body += "<h2 class='h5 mb-3'>Rebooting Device</h2>";
   body += "<p class='mb-3'>The ESP32 is applying the requested restart. Give it a few seconds to reconnect to WiFi, then reload the dashboard or config page.</p>";
   body += "<div class='alert alert-warning mb-0'>If you changed WiFi credentials or hostname, the device may come back on a new network name or IP address.</div>";
+  body += buildRebootWaitHtml();
   body += "</div></div>";
 
   server.send(200, "text/html; charset=utf-8", adminPageShell("Rebooting", "Applying the saved configuration by restarting the device.", body));
@@ -4196,6 +4536,7 @@ void handleSimpleRebootPath()
   body += "<h2 class='h5 mb-3'>Rebooting Device</h2>";
   body += "<p class='mb-3'>The ESP32 is restarting without changing any stored settings. Reload the dashboard or config page after a few seconds.</p>";
   body += "<div class='alert alert-warning mb-0'>This action keeps the current runtime configuration exactly as stored in NVS.</div>";
+  body += buildRebootWaitHtml();
   body += "</div></div>";
 
   server.send(200, "text/html; charset=utf-8", adminPageShell("Rebooting", "Restarting the device without modifying its saved configuration.", body));
